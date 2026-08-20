@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "fraud-risk-engine"
+version = "0.1.0"
+description = "Production fraud risk prediction service"
+requires-python = ">=3.14,<3.15"
+
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.52.3",
+    "pydantic==2.13.4",
+    "pandas==2.3.3",
+    "mlflow==3.15.1",
+    "scikit-learn==1.9.0",
+    "xgboost==3.4.1",
+    "joblib==1.5.3",
+]
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "httpx2",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests/test_api.py",
+    "tests/test_model_service.py",
+]
+markers = [
+    "integration: requires a running MLflow server and real model artifacts",
+]

@@ -1,0 +1,29 @@
+.venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.vscode/
+.DS_Store
+
+# Local MLflow state and generated model artifacts
+mlruns/
+mlartifacts/
+notebooks/mlflow.db
+notebooks/mlartifacts/
+*.db
+*.joblib
+*.pkl
+*.skops
+*.ubj
+
+# Local datasets and generated notebook figures
+data/raw/
+notebooks/*.png
+
+# Notebook scratch files
+.ipynb_checkpoints/
