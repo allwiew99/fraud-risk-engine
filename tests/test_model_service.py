@@ -71,7 +71,12 @@ def test_initialize_model_loads_once(monkeypatch):
     import fraud_risk.model_service as model_service
 
     calls = []
-    fake_model = object()
+    fake_model = SimpleNamespace(
+        manifest=SimpleNamespace(
+            model_version="3",
+            source_git_commit="a" * 40,
+        )
+    )
 
     def fake_load_model_bundle(uri):
         calls.append(uri)
@@ -112,6 +117,7 @@ def test_prediction_uses_threshold_from_verified_manifest(monkeypatch):
 
     fake_model = SimpleNamespace(
         manifest=SimpleNamespace(
+            model_version="3",
             threshold=0.9,
             features=list(NEGATIVE_PAYLOAD),
         ),
