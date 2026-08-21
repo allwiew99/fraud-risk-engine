@@ -48,6 +48,7 @@ testpaths = [
     "tests/test_release_manifest.py",
     "tests/test_model_bundle.py",
     "tests/test_release_export.py",
+    "tests/test_smoke_cloud_run.py",
 ]
 markers = [
     "integration: requires a running MLflow server and real model artifacts",
