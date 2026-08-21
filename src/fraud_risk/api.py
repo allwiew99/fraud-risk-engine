@@ -1,21 +1,69 @@
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import logging
 
-from fraud_risk.model_service import predict_fraud
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from fraud_risk.model_service import (
+    ModelNotReadyError,
+    get_model_load_error,
+    initialize_model,
+    is_model_ready,
+    predict_fraud,
+)
 from fraud_risk.schemas import (
     FraudPredictionRequest,
     FraudPredictionResponse,
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if initialize_model():
+        logger.info("Verified model release loaded")
+    else:
+        logger.error(
+            "Model release initialization failed: %s",
+            get_model_load_error(),
+        )
+    yield
+
+
 app = FastAPI(
     title="Fraud Risk Engine",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+
+@app.exception_handler(ModelNotReadyError)
+def model_not_ready_handler(
+    request: Request,
+    error: ModelNotReadyError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Model is not ready"},
+    )
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    model_ready = is_model_ready()
+    status = "ready" if model_ready else "not_ready"
+    status_code = 200 if model_ready else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": status},
+    )
 
 
 @app.post(

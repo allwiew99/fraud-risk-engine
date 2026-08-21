@@ -21,3 +21,4 @@ mlartifacts
 *.skops
 *.ubj
 .DS_Store
+dist

@@ -15,6 +15,24 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_ready_returns_503_before_model_is_loaded(monkeypatch):
+    monkeypatch.setattr(api, "is_model_ready", lambda: False)
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
+def test_ready_returns_200_after_model_is_loaded(monkeypatch):
+    monkeypatch.setattr(api, "is_model_ready", lambda: True)
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+
+
 def test_predict(monkeypatch):
     def fake_predict_fraud(request):
         return FraudPredictionResponse(

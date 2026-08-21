@@ -27,3 +27,6 @@ notebooks/*.png
 
 # Notebook scratch files
 .ipynb_checkpoints/
+
+# Generated immutable model release bundles
+dist/model-release/

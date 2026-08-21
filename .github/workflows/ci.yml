@@ -27,7 +27,7 @@ jobs:
           python -m pip install --editable ".[dev]"
 
       - name: Run fast tests
-        run: PYTHONPATH=src python -m pytest tests/test_api.py tests/test_model_service.py -q
+        run: PYTHONPATH=src python -m pytest -q
 
   docker-build:
     name: Docker build

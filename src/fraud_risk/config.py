@@ -8,4 +8,9 @@ MLFLOW_TRACKING_URI = os.getenv(
 )
 
 MODEL_URI = "models:/fraud-risk-model@champion"
-THRESHOLD = 0.90
+
+DEFAULT_MODEL_ARTIFACT_URI = "file:///app/model-release"
+MODEL_ARTIFACT_URI = os.getenv(
+    "MODEL_ARTIFACT_URI",
+    DEFAULT_MODEL_ARTIFACT_URI,
+)
