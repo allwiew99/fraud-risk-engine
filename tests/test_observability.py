@@ -7,7 +7,7 @@ from fraud_risk.schemas import FraudPredictionRequest
 
 
 PRODUCTION_MODEL_ARTIFACT_URI = (
-    "gs://fraud-risk-model-releases/v2-3e65f5fd-88b81f0/"
+    "gs://fraud-risk-engine-models/releases/v2-3e65f5fd-88b81f0/"
 )
 SOURCE_GIT_COMMIT = "88b81f0017c8d90457e16ffeeebb02dbe1642e1b"
 PREDICTION_PAYLOAD = {
