@@ -468,7 +468,6 @@ jobs:
             if OBSERVED_TRAFFIC_STATE="$(
               SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
                 CANDIDATE_REVISION="$CANDIDATE_REVISION" \
-                PREVIOUS_REVISION="$PREVIOUS_REVISION" \
                 python - <<'PY'
           import json
           import os
@@ -486,14 +485,16 @@ jobs:
 
           if exclusively_serves(os.environ["CANDIDATE_REVISION"]):
               print("candidate-100")
-          elif exclusively_serves(os.environ["PREVIOUS_REVISION"]):
-              print("previous-100")
           else:
               print("ambiguous")
           PY
             )"; then
               PROMOTION_TRAFFIC_STATE="$OBSERVED_TRAFFIC_STATE"
             fi
+          fi
+
+          if [[ "$PROMOTION_TRAFFIC_STATE" != "candidate-100" ]]; then
+            PROMOTION_TRAFFIC_STATE="ambiguous"
           fi
 
           {
@@ -509,17 +510,8 @@ jobs:
             candidate-100)
               echo "FINAL_SERVING_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
               ;;
-            previous-100)
-              echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
-              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; previous revision still has 100% traffic"
-              exit 1
-              ;;
             ambiguous)
-              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; remote traffic is ambiguous and rollback is armed"
-              ;;
-            *)
-              echo "::error::Unexpected promotion traffic state: $PROMOTION_TRAFFIC_STATE"
-              exit 1
+              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; candidate traffic is not confirmed and rollback is armed"
               ;;
           esac
 
