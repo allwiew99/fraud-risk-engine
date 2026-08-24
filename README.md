@@ -134,11 +134,17 @@ The production deployment settings encoded in the manual workflow are:
 Training and registration are local-only. MLflow records experiments, model
 versions, metrics, run identity, and the `champion` alias. A controlled export
 resolves that alias once to an immutable version and creates the release
-manifest and hashed artifacts. Export does not upload or deploy the release.
-
-The runtime package has no MLflow dependency. Integration tests use the local
-registry to prove that an exported bundle produces equivalent predictions;
+manifest and hashed artifacts. The runtime package has no MLflow dependency;
 ordinary tests, Docker runtime, and Cloud Run inference remain independent.
+
+Real integration and export require an approved pre-existing local registry database and artifact
+store containing `fraud-risk-model@champion`; for this release, that alias must resolve model
+version `2`. Those governed files are intentionally local and not distributed in Git. A clean
+checkout can run fast/default tests and build Docker, but cannot run real integration or export
+until the approved local state is restored.
+
+The already approved immutable production release is reused for the pending first automated
+rollout and must not be re-exported, overwritten, or regenerated merely for deployment.
 
 ## 8. CI, integration, and manual deployment workflows
 
@@ -254,7 +260,7 @@ python -m pip install --upgrade pip setuptools
 python -m pip install --editable ".[dev]"
 ```
 
-Start the local governance server only for release work or integration tests:
+After restoring the approved registry and artifact store, start its local server:
 
 ```bash
 python -m mlflow server \
@@ -264,7 +270,7 @@ python -m mlflow server \
   --port 5000
 ```
 
-Run the standard gates:
+Run fast tests/build directly; the integration target needs that restored state:
 
 ```bash
 make test
@@ -289,7 +295,6 @@ MODEL_ARTIFACT_URI="file://$PWD/dist/model-release/RELEASE_ID" \
 Build and run the same service in Docker with a read-only release mount:
 
 ```bash
-make docker-build-amd64
 MODEL_RELEASE_DIR="$PWD/dist/model-release/RELEASE_ID" make docker-run
 ```
 
