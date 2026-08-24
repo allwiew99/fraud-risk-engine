@@ -40,6 +40,19 @@ jobs:
       MODEL_RELEASE: ${{ inputs.model_release }}
       MODEL_VERSION: ${{ inputs.model_version }}
     steps:
+      - name: Initialize deployment time budget
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_STARTED_EPOCH="$(date +%s)"
+          PROMOTION_CUTOFF_EPOCH="$((DEPLOYMENT_STARTED_EPOCH + 2100))"
+          {
+            echo "DEPLOYMENT_STARTED_EPOCH=$DEPLOYMENT_STARTED_EPOCH"
+            echo "PROMOTION_CUTOFF_EPOCH=$PROMOTION_CUTOFF_EPOCH"
+          } >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -66,18 +79,21 @@ jobs:
           IMAGE="europe-west1-docker.pkg.dev/fraud-risk-engine/fraud-risk-engine/fraud-risk-engine"
           MODEL_ARTIFACT_URI="gs://fraud-risk-engine-models/releases/${MODEL_RELEASE}/"
           CANDIDATE_TAG="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ARTIFACT_TAG_RESOURCE="projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/repositories/${ARTIFACT_REPOSITORY}/packages/fraud-risk-engine/tags/${IMAGE_TAG}"
 
           {
             echo "IMAGE_TAG=$IMAGE_TAG"
             echo "IMAGE=$IMAGE"
             echo "MODEL_ARTIFACT_URI=$MODEL_ARTIFACT_URI"
             echo "CANDIDATE_TAG=$CANDIDATE_TAG"
+            echo "ARTIFACT_TAG_RESOURCE=$ARTIFACT_TAG_RESOURCE"
           } >> "$GITHUB_ENV"
           {
             echo "image_tag=$IMAGE_TAG"
             echo "image=$IMAGE"
             echo "model_artifact_uri=$MODEL_ARTIFACT_URI"
             echo "candidate_tag=$CANDIDATE_TAG"
+            echo "artifact_tag_resource=$ARTIFACT_TAG_RESOURCE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install project and development dependencies
@@ -165,30 +181,60 @@ jobs:
         run: gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
 
       - name: Require image tag to be unused
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
 
-          ARTIFACTS_JSON="$(
-            gcloud artifacts docker images list "$IMAGE" \
-              --include-tags \
+          if TAG_LOOKUP_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud artifacts tags list \
+              --package=fraud-risk-engine \
+              --repository="$ARTIFACT_REPOSITORY" \
+              --location="$GCP_REGION" \
               --project="$GCP_PROJECT_ID" \
+              --filter="name=\"$ARTIFACT_TAG_RESOURCE\"" \
+              --limit=2 \
               --format=json
-          )"
-          ARTIFACTS_JSON="$ARTIFACTS_JSON" IMAGE_TAG="$IMAGE_TAG" python - <<'PY'
+          )"; then
+            :
+          else
+            TAG_LOOKUP_STATUS=$?
+            echo "::error::Exact Artifact Registry tag lookup failed with exit $TAG_LOOKUP_STATUS; absence is not confirmed"
+            exit "$TAG_LOOKUP_STATUS"
+          fi
+
+          TAG_COUNT="$(
+            ARTIFACT_TAG_RESOURCE="$ARTIFACT_TAG_RESOURCE" python -c '
           import json
           import os
+          import sys
 
-          artifacts = json.loads(os.environ["ARTIFACTS_JSON"])
-          wanted = os.environ["IMAGE_TAG"]
-          tags = {
-              tag.rsplit("/", 1)[-1]
-              for artifact in artifacts
-              for tag in artifact.get("tags", [])
-          }
-          if wanted in tags:
-              raise SystemExit(f"immutable image tag already exists: {wanted}")
-          PY
+          records = json.load(sys.stdin)
+          if not isinstance(records, list):
+              raise SystemExit("Artifact Registry tag lookup did not return a JSON list")
+          wanted = os.environ["ARTIFACT_TAG_RESOURCE"]
+          for record in records:
+              if not isinstance(record, dict):
+                  raise SystemExit("Artifact Registry tag lookup returned a malformed record")
+              if record.get("name") != wanted or not record.get("version"):
+                  raise SystemExit("Artifact Registry tag lookup returned an unexpected record")
+          print(len(records))
+          ' <<< "$TAG_LOOKUP_JSON"
+          )"
+
+          case "$TAG_COUNT" in
+            0)
+              ;;
+            1)
+              echo "::error::Immutable image tag already exists: $IMAGE_TAG"
+              exit 1
+              ;;
+            *)
+              echo "::error::Exact Artifact Registry tag lookup returned $TAG_COUNT records"
+              exit 1
+              ;;
+          esac
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -214,6 +260,7 @@ jobs:
 
       - name: Resolve and cross-check immutable digest
         id: digest
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
@@ -222,32 +269,43 @@ jobs:
           BUILDX_DIGEST="$(
             awk '/^Digest:/ {print $2; exit}' <<< "$INSPECT_OUTPUT"
           )"
-          ARTIFACTS_JSON="$(
-            gcloud artifacts docker images list "$IMAGE" \
-              --include-tags \
+          if TAG_LOOKUP_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud artifacts tags list \
+              --package=fraud-risk-engine \
+              --repository="$ARTIFACT_REPOSITORY" \
+              --location="$GCP_REGION" \
               --project="$GCP_PROJECT_ID" \
+              --filter="name=\"$ARTIFACT_TAG_RESOURCE\"" \
+              --limit=2 \
               --format=json
-          )"
+          )"; then
+            :
+          else
+            TAG_LOOKUP_STATUS=$?
+            echo "::error::Exact Artifact Registry tag lookup failed with exit $TAG_LOOKUP_STATUS"
+            exit "$TAG_LOOKUP_STATUS"
+          fi
           ARTIFACT_DIGEST="$(
-            ARTIFACTS_JSON="$ARTIFACTS_JSON" IMAGE_TAG="$IMAGE_TAG" python - <<'PY'
+            ARTIFACT_TAG_RESOURCE="$ARTIFACT_TAG_RESOURCE" python -c '
           import json
           import os
+          import re
+          import sys
 
-          artifacts = json.loads(os.environ["ARTIFACTS_JSON"])
-          wanted = os.environ["IMAGE_TAG"]
-          digests = {
-              artifact.get("version", "").rsplit("/", 1)[-1]
-              for artifact in artifacts
-              if wanted
-              in {tag.rsplit("/", 1)[-1] for tag in artifact.get("tags", [])}
-          }
-          digests.discard("")
-          if len(digests) != 1:
-              raise SystemExit(
-                  f"expected one Artifact Registry digest for {wanted}; found {len(digests)}"
-              )
-          print(digests.pop())
-          PY
+          records = json.load(sys.stdin)
+          wanted = os.environ["ARTIFACT_TAG_RESOURCE"]
+          if not isinstance(records, list) or len(records) != 1:
+              count = len(records) if isinstance(records, list) else "non-list"
+              raise SystemExit(f"expected one exact Artifact Registry tag; found {count}")
+          record = records[0]
+          if not isinstance(record, dict) or record.get("name") != wanted:
+              raise SystemExit("Artifact Registry tag lookup returned an unexpected record")
+          digest = record.get("version", "").rsplit("/", 1)[-1]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("Artifact Registry tag resolved to an invalid digest")
+          print(digest)
+          ' <<< "$TAG_LOOKUP_JSON"
           )"
 
           [[ "$BUILDX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -356,27 +414,133 @@ jobs:
 
       - name: Smoke candidate route
         id: candidate_smoke
-        run: python scripts/smoke_cloud_run.py --service-url="$CANDIDATE_URL"
+        timeout-minutes: 3
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          python scripts/smoke_cloud_run.py --service-url="$CANDIDATE_URL"
 
-      - name: Promote candidate revision to 100 percent
-        id: promote
+      - name: Reserve post-promotion rollback window
+        id: promotion_gate
+        timeout-minutes: 1
         shell: bash
         run: |
           set -euo pipefail
 
-          gcloud run services update-traffic fraud-risk-api \
-            --to-revisions="$CANDIDATE_REVISION=100" \
-            --region=europe-west1 \
-            --project=fraud-risk-engine \
-            --quiet
+          NOW_EPOCH="$(date +%s)"
+          if (( NOW_EPOCH >= PROMOTION_CUTOFF_EPOCH )); then
+            echo "::error::Promotion cutoff reached; production traffic remains unchanged"
+            exit 1
+          fi
+          ROLLBACK_RESERVE_SECONDS="$((DEPLOYMENT_STARTED_EPOCH + 3600 - NOW_EPOCH))"
+          echo "rollback_reserve_seconds=$ROLLBACK_RESERVE_SECONDS" >> "$GITHUB_OUTPUT"
+
+      - name: Promote candidate revision to 100 percent
+        id: promote
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
+
+          PROMOTION_COMMAND_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$CANDIDATE_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            PROMOTION_COMMAND_OUTCOME="success"
+          else
+            PROMOTION_COMMAND_STATUS=$?
+            PROMOTION_COMMAND_OUTCOME="exit-$PROMOTION_COMMAND_STATUS"
+          fi
+
+          PROMOTION_TRAFFIC_STATE="ambiguous"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"; then
+            if OBSERVED_TRAFFIC_STATE="$(
+              SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+                CANDIDATE_REVISION="$CANDIDATE_REVISION" \
+                PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+                python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          ordinary = [entry for entry in traffic if not entry.get("tag")]
+
+          def exclusively_serves(revision):
+              return (
+                  len(ordinary) == 1
+                  and ordinary[0].get("revisionName") == revision
+                  and int(ordinary[0].get("percent", 0) or 0) == 100
+              )
+
+          if exclusively_serves(os.environ["CANDIDATE_REVISION"]):
+              print("candidate-100")
+          elif exclusively_serves(os.environ["PREVIOUS_REVISION"]):
+              print("previous-100")
+          else:
+              print("ambiguous")
+          PY
+            )"; then
+              PROMOTION_TRAFFIC_STATE="$OBSERVED_TRAFFIC_STATE"
+            fi
+          fi
+
+          {
+            echo "PROMOTION_COMMAND_OUTCOME=$PROMOTION_COMMAND_OUTCOME"
+            echo "PROMOTION_TRAFFIC_STATE=$PROMOTION_TRAFFIC_STATE"
+          } >> "$GITHUB_ENV"
+          {
+            echo "command_outcome=$PROMOTION_COMMAND_OUTCOME"
+            echo "traffic_state=$PROMOTION_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          case "$PROMOTION_TRAFFIC_STATE" in
+            candidate-100)
+              echo "FINAL_SERVING_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
+              ;;
+            previous-100)
+              echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; previous revision still has 100% traffic"
+              exit 1
+              ;;
+            ambiguous)
+              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; remote traffic is ambiguous and rollback is armed"
+              ;;
+            *)
+              echo "::error::Unexpected promotion traffic state: $PROMOTION_TRAFFIC_STATE"
+              exit 1
+              ;;
+          esac
+
+      - name: Fail ambiguous promotion reconciliation
+        id: promotion_reconciliation
+        if: steps.promote.outputs.traffic_state == 'ambiguous'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          echo "::error::Promotion state is ambiguous; triggering traffic rollback"
+          exit 1
 
       - name: Verify promoted traffic
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
 
           SERVICE_STATE_JSON="$(
-            gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
               --region="$GCP_REGION" \
               --project="$GCP_PROJECT_ID" \
               --platform=managed \
@@ -404,26 +568,33 @@ jobs:
 
       - name: Smoke canonical route
         id: canonical_smoke
-        run: python scripts/smoke_cloud_run.py --service-url="$SERVICE_URL"
+        timeout-minutes: 3
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          python scripts/smoke_cloud_run.py --service-url="$SERVICE_URL"
 
       - name: Remove temporary candidate traffic tag
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
 
-          gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
-            --remove-tags="$CANDIDATE_TAG" \
-            --region="$GCP_REGION" \
-            --project="$GCP_PROJECT_ID" \
-            --quiet
+          timeout --signal=TERM --kill-after=10s 60s \
+            gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+              --remove-tags="$CANDIDATE_TAG" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --quiet
 
       - name: Require service IAM to remain private
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
 
           IAM_POLICY_JSON="$(
-            gcloud run services get-iam-policy "$CLOUD_RUN_SERVICE" \
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services get-iam-policy "$CLOUD_RUN_SERVICE" \
               --region="$GCP_REGION" \
               --project="$GCP_PROJECT_ID" \
               --platform=managed \
@@ -448,26 +619,38 @@ jobs:
       - name: Roll back production traffic after post-promotion failure
         id: rollback
         if: failure() && steps.promote.outcome == 'success'
+        timeout-minutes: 5
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          gcloud run services update-traffic fraud-risk-api \
-            --to-revisions="$PREVIOUS_REVISION=100" \
-            --region=europe-west1 \
-            --project=fraud-risk-engine \
-            --quiet
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
 
-          SERVICE_STATE_JSON="$(
-            gcloud run services describe "$CLOUD_RUN_SERVICE" \
+          ROLLBACK_COMMAND_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$PREVIOUS_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            ROLLBACK_COMMAND_OUTCOME="success"
+          else
+            ROLLBACK_COMMAND_STATUS=$?
+            ROLLBACK_COMMAND_OUTCOME="exit-$ROLLBACK_COMMAND_STATUS"
+          fi
+
+          ROLLBACK_TRAFFIC_STATE="unknown"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
               --region="$GCP_REGION" \
               --project="$GCP_PROJECT_ID" \
               --platform=managed \
               --format=json
-          )"
-          SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
-            PREVIOUS_REVISION="$PREVIOUS_REVISION" \
-            python - <<'PY'
+          )"; then
+            if SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+              PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+              python - <<'PY'
           import json
           import os
 
@@ -483,16 +666,100 @@ jobs:
           if len(restored) != 1:
               raise SystemExit("rollback did not restore the previous revision to 100%")
           PY
+            then
+              ROLLBACK_TRAFFIC_STATE="previous-100"
+            fi
+          fi
+
+          {
+            echo "command_outcome=$ROLLBACK_COMMAND_OUTCOME"
+            echo "traffic_state=$ROLLBACK_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$ROLLBACK_TRAFFIC_STATE" != "previous-100" ]]; then
+            echo "::error::Rollback command outcome was $ROLLBACK_COMMAND_OUTCOME; final serving revision is unknown"
+            exit 1
+          fi
+          echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+      - name: Best-effort traffic rollback on cancellation
+        id: cancellation_rollback
+        if: cancelled() && steps.promotion_gate.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
+
+          CANCELLATION_ROLLBACK_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$PREVIOUS_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            CANCELLATION_ROLLBACK_OUTCOME="success"
+          else
+            CANCELLATION_ROLLBACK_STATUS=$?
+            CANCELLATION_ROLLBACK_OUTCOME="exit-$CANCELLATION_ROLLBACK_STATUS"
+          fi
+
+          CANCELLATION_TRAFFIC_STATE="unknown"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"; then
+            if SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+              PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+              python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          restored = [
+              entry
+              for entry in traffic
+              if not entry.get("tag")
+              and entry.get("revisionName") == os.environ["PREVIOUS_REVISION"]
+              and int(entry.get("percent", 0) or 0) == 100
+          ]
+          if len(restored) != 1:
+              raise SystemExit("cancellation rollback did not restore the previous revision")
+          PY
+            then
+              CANCELLATION_TRAFFIC_STATE="previous-100"
+            fi
+          fi
+
+          {
+            echo "command_outcome=$CANCELLATION_ROLLBACK_OUTCOME"
+            echo "traffic_state=$CANCELLATION_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$CANCELLATION_TRAFFIC_STATE" != "previous-100" ]]; then
+            echo "::error::Cancellation rollback outcome was $CANCELLATION_ROLLBACK_OUTCOME; final serving revision is unknown"
+            exit 1
+          fi
           echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
 
       - name: Write deployment summary
         if: always()
+        timeout-minutes: 1
         shell: bash
         env:
           CANDIDATE_SMOKE_OUTCOME: ${{ steps.candidate_smoke.outcome }}
           CANONICAL_SMOKE_OUTCOME: ${{ steps.canonical_smoke.outcome }}
           PROMOTION_OUTCOME: ${{ steps.promote.outcome }}
+          PROMOTION_COMMAND_OUTCOME: ${{ steps.promote.outputs.command_outcome }}
+          PROMOTION_TRAFFIC_STATE: ${{ steps.promote.outputs.traffic_state }}
           ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          CANCELLATION_ROLLBACK_OUTCOME: ${{ steps.cancellation_rollback.outcome }}
         run: |
           set -euo pipefail
 
@@ -519,5 +786,8 @@ jobs:
             echo "- Final serving revision: \`${FINAL_SERVING_REVISION:-not-recorded}\`"
             echo "- Smoke conclusion: ${SMOKE_CONCLUSION}"
             echo "- Promotion outcome: ${PROMOTION_OUTCOME:-not-run}"
+            echo "- Promotion command outcome: ${PROMOTION_COMMAND_OUTCOME:-not-run}"
+            echo "- Promotion traffic state: ${PROMOTION_TRAFFIC_STATE:-not-observed}"
             echo "- Rollback outcome: ${ROLLBACK_OUTCOME:-not-run}"
+            echo "- Cancellation rollback outcome: ${CANCELLATION_ROLLBACK_OUTCOME:-not-run}"
           } >> "$GITHUB_STEP_SUMMARY"
