@@ -16,6 +16,11 @@ class ModelNotReadyError(RuntimeError):
     pass
 
 
+class PredictionFailedError(RuntimeError):
+    def __init__(self):
+        super().__init__("Prediction failed")
+
+
 _model = None
 _model_load_error: Exception | None = None
 logger = logging.getLogger(__name__)
@@ -85,6 +90,7 @@ def predict_fraud(
     request: FraudPredictionRequest,
 ) -> FraudPredictionResponse:
     started_at = perf_counter()
+    prediction_failed = False
     try:
         model = get_model()
         input_df = pd.DataFrame(
@@ -99,6 +105,8 @@ def predict_fraud(
             is_fraud=is_fraud,
             threshold=threshold,
         )
+    except ModelNotReadyError:
+        raise
     except Exception as error:
         log_event(
             logger,
@@ -108,7 +116,10 @@ def predict_fraud(
             exception_type=type(error).__name__,
             error_message="Prediction failed",
         )
-        raise
+        prediction_failed = True
+
+    if prediction_failed:
+        raise PredictionFailedError() from None
 
     log_event(
         logger,

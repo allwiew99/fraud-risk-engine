@@ -1,10 +1,13 @@
 import io
 import json
+from pathlib import Path
+import sys
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler
 
 import pytest
 
+import scripts.smoke_cloud_run as smoke_cloud_run
 from scripts.smoke_cloud_run import SmokeCheckError, run_smoke_tests
 
 
@@ -323,3 +326,101 @@ def test_smoke_normalizes_malformed_bodies_to_safe_errors(response, expected_mes
     assert "untrusted response" not in str(error.value)
     assert "test-token" not in str(error.value)
     assert "income" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("malformed", "transport", "semantic"),
+)
+def test_main_emits_one_fixed_safe_line_for_smoke_failures(
+    monkeypatch,
+    capsys,
+    failure_kind,
+):
+    token = "cli-token-secret-428af9"
+    raw_response = "raw-response-secret-17a20c"
+    feature_detail = "income=0.987654"
+    transport_detail = f"{Path.cwd()}/transport-secret"
+    decoder_detail = "decoder-secret-50d4a1"
+
+    def fail_smoke(service_url, identity_token):
+        assert service_url == "https://service.example"
+        assert identity_token == token
+        if failure_kind == "malformed":
+            try:
+                raise UnicodeDecodeError(
+                    "utf-8",
+                    b"\xff",
+                    0,
+                    1,
+                    decoder_detail,
+                )
+            except UnicodeDecodeError as error:
+                raise SmokeCheckError(
+                    f"malformed response: {raw_response}"
+                ) from error
+        if failure_kind == "transport":
+            raise SmokeCheckError(
+                f"transport failure at {transport_detail}"
+            )
+        raise SmokeCheckError(
+            f"semantic mismatch for {feature_detail}"
+        )
+
+    monkeypatch.setattr(smoke_cloud_run, "run_smoke_tests", fail_smoke)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke_cloud_run.py", "--service-url=https://service.example"],
+    )
+    monkeypatch.setenv("CLOUD_RUN_ID_TOKEN", token)
+
+    exit_code = smoke_cloud_run.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Cloud Run smoke verification failed\n"
+    for unsafe_value in (
+        token,
+        raw_response,
+        feature_detail,
+        "income",
+        "0.987654",
+        transport_detail,
+        decoder_detail,
+        "UnicodeDecodeError",
+        "SmokeCheckError",
+        "Traceback",
+    ):
+        assert unsafe_value not in captured.err
+
+
+def test_main_preserves_success_json_output(monkeypatch, capsys):
+    result = {
+        "health": 200,
+        "ready": 200,
+        "negative_probability": 0.13046391308307648,
+        "negative_absolute_difference": 0.0,
+        "positive_probability": 0.9620175957679749,
+        "positive_absolute_difference": 0.0,
+    }
+    monkeypatch.setattr(
+        smoke_cloud_run,
+        "run_smoke_tests",
+        lambda service_url, identity_token: result,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke_cloud_run.py", "--service-url=https://service.example"],
+    )
+    monkeypatch.setenv("CLOUD_RUN_ID_TOKEN", "success-token-secret")
+
+    exit_code = smoke_cloud_run.main()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == f"{json.dumps(result, sort_keys=True)}\n"
+    assert captured.err == ""
+    assert "success-token-secret" not in captured.out

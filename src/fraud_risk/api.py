@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from fraud_risk.model_service import (
     ModelNotReadyError,
+    PredictionFailedError,
     initialize_model,
     is_model_ready,
     predict_fraud,
@@ -39,6 +40,17 @@ def model_not_ready_handler(
     return JSONResponse(
         status_code=503,
         content={"detail": "Model is not ready"},
+    )
+
+
+@app.exception_handler(PredictionFailedError)
+def prediction_failed_handler(
+    request: Request,
+    error: PredictionFailedError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Prediction failed"},
     )
 
 

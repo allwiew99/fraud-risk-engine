@@ -1,6 +1,7 @@
 import importlib
 from types import SimpleNamespace
 import sys
+import traceback
 
 import pytest
 
@@ -133,3 +134,59 @@ def test_prediction_uses_threshold_from_verified_manifest(monkeypatch):
     assert response.fraud_probability == 0.91
     assert response.is_fraud is True
     assert response.threshold == 0.9
+
+
+def test_prediction_failure_uses_fixed_exception_without_raw_context(
+    monkeypatch,
+):
+    import fraud_risk.model_service as model_service
+
+    raw_secret = "raw-model-secret-35b9a4"
+    failed_events = []
+
+    def fail_prediction(frame):
+        raise ValueError(raw_secret)
+
+    def capture_event(logger, level, event, message, **fields):
+        failed_events.append((event, message, fields))
+
+    fake_model = SimpleNamespace(
+        manifest=SimpleNamespace(
+            model_version="2",
+            threshold=0.9,
+            features=list(NEGATIVE_PAYLOAD),
+        ),
+        predict=fail_prediction,
+    )
+    reset_model_state(model_service)
+    model_service._model = fake_model
+    monkeypatch.setattr(model_service, "log_event", capture_event)
+
+    with pytest.raises(RuntimeError) as raised:
+        model_service.predict_fraud(
+            FraudPredictionRequest.model_validate(NEGATIVE_PAYLOAD)
+        )
+
+    formatted_exception = "".join(
+        traceback.format_exception(
+            raised.type,
+            raised.value,
+            raised.tb,
+        )
+    )
+    assert type(raised.value).__name__ == "PredictionFailedError"
+    assert str(raised.value) == "Prediction failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.__suppress_context__ is True
+    assert raw_secret not in formatted_exception
+    assert failed_events == [
+        (
+            "prediction_failed",
+            "Prediction failed",
+            {
+                "exception_type": "ValueError",
+                "error_message": "Prediction failed",
+            },
+        )
+    ]

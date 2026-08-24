@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
@@ -192,15 +193,21 @@ def run_smoke_tests(service_url: str, identity_token: str, opener=urlopen) -> di
     }
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-url", required=True)
     args = parser.parse_args()
     identity_token = os.environ.get("CLOUD_RUN_ID_TOKEN")
     if not identity_token:
         parser.error("CLOUD_RUN_ID_TOKEN must be set")
-    print(json.dumps(run_smoke_tests(args.service_url, identity_token), sort_keys=True))
+    try:
+        result = run_smoke_tests(args.service_url, identity_token)
+    except SmokeCheckError:
+        print("Cloud Run smoke verification failed", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

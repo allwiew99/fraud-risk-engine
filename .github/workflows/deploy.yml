@@ -134,11 +134,42 @@ jobs:
           import os
 
           state = json.loads(os.environ["SERVICE_STATE_JSON"])
-          status = state.get("status", {})
-          revision = status.get("latestReadyRevisionName")
+          status = state.get("status")
+          if not isinstance(status, dict):
+              raise SystemExit("existing Cloud Run service has malformed status")
           url = status.get("url")
-          if not revision or not url:
-              raise SystemExit("existing Cloud Run service is missing a ready revision or URL")
+          if not isinstance(url, str) or not url:
+              raise SystemExit("existing Cloud Run service is missing its canonical URL")
+
+          traffic = status.get("traffic")
+          if not isinstance(traffic, list):
+              raise SystemExit("existing Cloud Run service has malformed traffic state")
+          ordinary = []
+          for entry in traffic:
+              if not isinstance(entry, dict):
+                  raise SystemExit("existing Cloud Run service has malformed traffic state")
+              if "tag" in entry:
+                  tag = entry.get("tag")
+                  if not isinstance(tag, str) or not tag:
+                      raise SystemExit("existing Cloud Run service has malformed traffic tag")
+                  continue
+              ordinary.append(entry)
+          if len(ordinary) != 1:
+              raise SystemExit(
+                  "expected exactly one untagged serving revision"
+              )
+
+          revision = ordinary[0].get("revisionName")
+          percent = ordinary[0].get("percent")
+          if (
+              not isinstance(revision, str)
+              or not revision
+              or type(percent) is not int
+              or percent != 100
+          ):
+              raise SystemExit(
+                  "serving revision must be explicit at 100 percent ordinary traffic"
+              )
           print(f"{revision}\t{url}")
           PY
           )"
