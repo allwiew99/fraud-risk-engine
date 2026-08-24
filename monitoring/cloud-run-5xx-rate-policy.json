@@ -1,0 +1,40 @@
+{
+  "displayName": "Fraud Risk API sustained 5xx rate",
+  "combiner": "OR",
+  "enabled": true,
+  "documentation": {
+    "content": "The fraud-risk-api 5xx ratio exceeded 5% for five minutes. Inspect the latest Cloud Run revision, structured model_startup/model_startup_failed events, and request logs. No notification channel is configured; incidents are visible in Cloud Monitoring.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "5xx responses exceed 5% for 5 minutes",
+      "conditionThreshold": {
+        "filter": "metric.type=\"run.googleapis.com/request_count\" AND resource.type=\"cloud_run_revision\" AND resource.label.service_name=\"fraud-risk-api\" AND resource.label.location=\"europe-west1\" AND metric.label.response_code_class=\"5xx\"",
+        "denominatorFilter": "metric.type=\"run.googleapis.com/request_count\" AND resource.type=\"cloud_run_revision\" AND resource.label.service_name=\"fraud-risk-api\" AND resource.label.location=\"europe-west1\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": ["resource.label.service_name"]
+          }
+        ],
+        "denominatorAggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_DELTA",
+            "crossSeriesReducer": "REDUCE_SUM",
+            "groupByFields": ["resource.label.service_name"]
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0.05,
+        "duration": "300s",
+        "trigger": {"count": 1},
+        "evaluationMissingData": "EVALUATION_MISSING_DATA_INACTIVE"
+      }
+    }
+  ],
+  "alertStrategy": {"autoClose": "1800s"}
+}

@@ -1,34 +1,27 @@
 from contextlib import asynccontextmanager
-import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from fraud_risk.model_service import (
     ModelNotReadyError,
-    get_model_load_error,
+    PredictionFailedError,
     initialize_model,
     is_model_ready,
     predict_fraud,
 )
+from fraud_risk.observability import configure_application_logging
 from fraud_risk.schemas import (
     FraudPredictionRequest,
     FraudPredictionResponse,
 )
 
-
-logger = logging.getLogger(__name__)
+configure_application_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if initialize_model():
-        logger.info("Verified model release loaded")
-    else:
-        logger.error(
-            "Model release initialization failed: %s",
-            get_model_load_error(),
-        )
+    initialize_model()
     yield
 
 
@@ -47,6 +40,17 @@ def model_not_ready_handler(
     return JSONResponse(
         status_code=503,
         content={"detail": "Model is not ready"},
+    )
+
+
+@app.exception_handler(PredictionFailedError)
+def prediction_failed_handler(
+    request: Request,
+    error: PredictionFailedError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Prediction failed"},
     )
 
 

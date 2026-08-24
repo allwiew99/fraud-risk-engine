@@ -1,0 +1,816 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_release:
+        description: Immutable GCS release directory name
+        required: true
+        default: v2-3e65f5fd-88b81f0
+        type: string
+      model_version:
+        description: Immutable registered model version
+        required: true
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fraud-risk-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: fraud-risk-engine
+      GCP_PROJECT_NUMBER: "966306760612"
+      GCP_REGION: europe-west1
+      ARTIFACT_REPOSITORY: fraud-risk-engine
+      CLOUD_RUN_SERVICE: fraud-risk-api
+      RUNTIME_SERVICE_ACCOUNT: fraud-risk-api-runtime@fraud-risk-engine.iam.gserviceaccount.com
+      MODEL_BUCKET: fraud-risk-engine-models
+      MODEL_RELEASE: ${{ inputs.model_release }}
+      MODEL_VERSION: ${{ inputs.model_version }}
+    steps:
+      - name: Initialize deployment time budget
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOYMENT_STARTED_EPOCH="$(date +%s)"
+          PROMOTION_CUTOFF_EPOCH="$((DEPLOYMENT_STARTED_EPOCH + 2100))"
+          {
+            echo "DEPLOYMENT_STARTED_EPOCH=$DEPLOYMENT_STARTED_EPOCH"
+            echo "PROMOTION_CUTOFF_EPOCH=$PROMOTION_CUTOFF_EPOCH"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Validate source and immutable inputs
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$MODEL_VERSION" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MODEL_RELEASE" =~ ^v[1-9][0-9]*-[a-z0-9][a-z0-9-]*$ ]]
+          [[ "$MODEL_RELEASE" == "v$MODEL_VERSION-"* ]]
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IMAGE_TAG="${SHORT_SHA}-${MODEL_RELEASE}"
+          IMAGE="europe-west1-docker.pkg.dev/fraud-risk-engine/fraud-risk-engine/fraud-risk-engine"
+          MODEL_ARTIFACT_URI="gs://fraud-risk-engine-models/releases/${MODEL_RELEASE}/"
+          CANDIDATE_TAG="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ARTIFACT_TAG_RESOURCE="projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/repositories/${ARTIFACT_REPOSITORY}/packages/fraud-risk-engine/tags/${IMAGE_TAG}"
+
+          {
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "IMAGE=$IMAGE"
+            echo "MODEL_ARTIFACT_URI=$MODEL_ARTIFACT_URI"
+            echo "CANDIDATE_TAG=$CANDIDATE_TAG"
+            echo "ARTIFACT_TAG_RESOURCE=$ARTIFACT_TAG_RESOURCE"
+          } >> "$GITHUB_ENV"
+          {
+            echo "image_tag=$IMAGE_TAG"
+            echo "image=$IMAGE"
+            echo "model_artifact_uri=$MODEL_ARTIFACT_URI"
+            echo "candidate_tag=$CANDIDATE_TAG"
+            echo "artifact_tag_resource=$ARTIFACT_TAG_RESOURCE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install project and development dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools
+          python -m pip install --editable ".[dev]"
+
+      - name: Run default test suite
+        run: PYTHONPATH=src python -m pytest -q
+
+      - name: Authenticate to Google Cloud with Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Verify existing private service
+        id: service_preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SERVICE_STATE_JSON="$(
+            gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"
+          SERVICE_DETAILS="$(
+            SERVICE_STATE_JSON="$SERVICE_STATE_JSON" python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          status = state.get("status")
+          if not isinstance(status, dict):
+              raise SystemExit("existing Cloud Run service has malformed status")
+          url = status.get("url")
+          if not isinstance(url, str) or not url:
+              raise SystemExit("existing Cloud Run service is missing its canonical URL")
+
+          traffic = status.get("traffic")
+          if not isinstance(traffic, list):
+              raise SystemExit("existing Cloud Run service has malformed traffic state")
+          ordinary = []
+          for entry in traffic:
+              if not isinstance(entry, dict):
+                  raise SystemExit("existing Cloud Run service has malformed traffic state")
+              if "tag" in entry:
+                  tag = entry.get("tag")
+                  if not isinstance(tag, str) or not tag:
+                      raise SystemExit("existing Cloud Run service has malformed traffic tag")
+                  continue
+              ordinary.append(entry)
+          if len(ordinary) != 1:
+              raise SystemExit(
+                  "expected exactly one untagged serving revision"
+              )
+
+          revision = ordinary[0].get("revisionName")
+          percent = ordinary[0].get("percent")
+          if (
+              not isinstance(revision, str)
+              or not revision
+              or type(percent) is not int
+              or percent != 100
+          ):
+              raise SystemExit(
+                  "serving revision must be explicit at 100 percent ordinary traffic"
+              )
+          print(f"{revision}\t{url}")
+          PY
+          )"
+          IFS=$'\t' read -r PREVIOUS_REVISION SERVICE_URL <<< "$SERVICE_DETAILS"
+
+          IAM_POLICY_JSON="$(
+            gcloud run services get-iam-policy "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"
+          IAM_POLICY_JSON="$IAM_POLICY_JSON" python - <<'PY'
+          import json
+          import os
+
+          policy = json.loads(os.environ["IAM_POLICY_JSON"])
+          public_members = {"allUsers", "allAuthenticatedUsers"}
+          members = {
+              member
+              for binding in policy.get("bindings", [])
+              for member in binding.get("members", [])
+          }
+          exposed = sorted(public_members & members)
+          if exposed:
+              raise SystemExit(f"Cloud Run service is public: {', '.join(exposed)}")
+          PY
+
+          {
+            echo "PREVIOUS_REVISION=$PREVIOUS_REVISION"
+            echo "SERVICE_URL=$SERVICE_URL"
+            echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION"
+          } >> "$GITHUB_ENV"
+          {
+            echo "previous_revision=$PREVIOUS_REVISION"
+            echo "service_url=$SERVICE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure Docker authentication for regional registry
+        run: gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
+
+      - name: Require image tag to be unused
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if TAG_LOOKUP_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud artifacts tags list \
+              --package=fraud-risk-engine \
+              --repository="$ARTIFACT_REPOSITORY" \
+              --location="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --filter="name=\"$ARTIFACT_TAG_RESOURCE\"" \
+              --limit=2 \
+              --format=json
+          )"; then
+            :
+          else
+            TAG_LOOKUP_STATUS=$?
+            echo "::error::Exact Artifact Registry tag lookup failed with exit $TAG_LOOKUP_STATUS; absence is not confirmed"
+            exit "$TAG_LOOKUP_STATUS"
+          fi
+
+          TAG_COUNT="$(
+            ARTIFACT_TAG_RESOURCE="$ARTIFACT_TAG_RESOURCE" python -c '
+          import json
+          import os
+          import sys
+
+          records = json.load(sys.stdin)
+          if not isinstance(records, list):
+              raise SystemExit("Artifact Registry tag lookup did not return a JSON list")
+          wanted = os.environ["ARTIFACT_TAG_RESOURCE"]
+          for record in records:
+              if not isinstance(record, dict):
+                  raise SystemExit("Artifact Registry tag lookup returned a malformed record")
+              if record.get("name") != wanted or not record.get("version"):
+                  raise SystemExit("Artifact Registry tag lookup returned an unexpected record")
+          print(len(records))
+          ' <<< "$TAG_LOOKUP_JSON"
+          )"
+
+          case "$TAG_COUNT" in
+            0)
+              ;;
+            1)
+              echo "::error::Immutable image tag already exists: $IMAGE_TAG"
+              exit 1
+              ;;
+            *)
+              echo "::error::Exact Artifact Registry tag lookup returned $TAG_COUNT records"
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push immutable image once
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/allwiew99/fraud-risk-engine" \
+            --label "org.opencontainers.image.version=$IMAGE_TAG" \
+            --label "com.fraud-risk.model.version=$MODEL_VERSION" \
+            --label "com.fraud-risk.model.release=$MODEL_RELEASE" \
+            --label "com.fraud-risk.model.uri=$MODEL_ARTIFACT_URI" \
+            --tag "$IMAGE:$IMAGE_TAG" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --push \
+            .
+
+      - name: Resolve and cross-check immutable digest
+        id: digest
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INSPECT_OUTPUT="$(docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG")"
+          BUILDX_DIGEST="$(
+            awk '/^Digest:/ {print $2; exit}' <<< "$INSPECT_OUTPUT"
+          )"
+          if TAG_LOOKUP_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud artifacts tags list \
+              --package=fraud-risk-engine \
+              --repository="$ARTIFACT_REPOSITORY" \
+              --location="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --filter="name=\"$ARTIFACT_TAG_RESOURCE\"" \
+              --limit=2 \
+              --format=json
+          )"; then
+            :
+          else
+            TAG_LOOKUP_STATUS=$?
+            echo "::error::Exact Artifact Registry tag lookup failed with exit $TAG_LOOKUP_STATUS"
+            exit "$TAG_LOOKUP_STATUS"
+          fi
+          ARTIFACT_DIGEST="$(
+            ARTIFACT_TAG_RESOURCE="$ARTIFACT_TAG_RESOURCE" python -c '
+          import json
+          import os
+          import re
+          import sys
+
+          records = json.load(sys.stdin)
+          wanted = os.environ["ARTIFACT_TAG_RESOURCE"]
+          if not isinstance(records, list) or len(records) != 1:
+              count = len(records) if isinstance(records, list) else "non-list"
+              raise SystemExit(f"expected one exact Artifact Registry tag; found {count}")
+          record = records[0]
+          if not isinstance(record, dict) or record.get("name") != wanted:
+              raise SystemExit("Artifact Registry tag lookup returned an unexpected record")
+          digest = record.get("version", "").rsplit("/", 1)[-1]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("Artifact Registry tag resolved to an invalid digest")
+          print(digest)
+          ' <<< "$TAG_LOOKUP_JSON"
+          )"
+
+          [[ "$BUILDX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$BUILDX_DIGEST" = "$ARTIFACT_DIGEST"
+          DIGEST="$BUILDX_DIGEST"
+
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy zero-traffic candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gcloud run deploy fraud-risk-api \
+            --image="$IMAGE@$DIGEST" \
+            --region=europe-west1 \
+            --project=fraud-risk-engine \
+            --platform=managed \
+            --service-account=fraud-risk-api-runtime@fraud-risk-engine.iam.gserviceaccount.com \
+            --set-env-vars="MODEL_ARTIFACT_URI=$MODEL_ARTIFACT_URI" \
+            --cpu=1 \
+            --memory=1Gi \
+            --min=0 \
+            --max=3 \
+            --concurrency=4 \
+            --timeout=60 \
+            --cpu-boost \
+            --no-traffic \
+            --tag="$CANDIDATE_TAG" \
+            --quiet
+
+      - name: Verify zero-traffic candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SERVICE_STATE_JSON="$(
+            gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"
+          CANDIDATE_DETAILS="$(
+            SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+              CANDIDATE_TAG="$CANDIDATE_TAG" \
+              PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+              python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          status = state.get("status", {})
+          traffic = status.get("traffic", [])
+          candidate_entries = [
+              entry for entry in traffic if entry.get("tag") == os.environ["CANDIDATE_TAG"]
+          ]
+          if len(candidate_entries) != 1:
+              raise SystemExit("expected exactly one candidate traffic-tag entry")
+          candidate = candidate_entries[0]
+          candidate_revision = candidate.get("revisionName")
+          candidate_url = candidate.get("url")
+          if not candidate_revision or not candidate_url:
+              raise SystemExit("candidate traffic-tag entry is missing revision or URL")
+          if candidate_revision == os.environ["PREVIOUS_REVISION"]:
+              raise SystemExit("candidate did not create a new revision")
+          if status.get("latestReadyRevisionName") != candidate_revision:
+              raise SystemExit("candidate is not the ready revision")
+          if int(candidate.get("percent", 0) or 0) != 0:
+              raise SystemExit("candidate unexpectedly received ordinary traffic")
+
+          previous_entries = [
+              entry
+              for entry in traffic
+              if not entry.get("tag")
+              and entry.get("revisionName") == os.environ["PREVIOUS_REVISION"]
+              and int(entry.get("percent", 0) or 0) == 100
+          ]
+          if len(previous_entries) != 1:
+              raise SystemExit("previous revision no longer has 100% ordinary traffic")
+          print(f"{candidate_revision}\t{candidate_url}")
+          PY
+          )"
+          IFS=$'\t' read -r CANDIDATE_REVISION CANDIDATE_URL <<< "$CANDIDATE_DETAILS"
+
+          {
+            echo "CANDIDATE_REVISION=$CANDIDATE_REVISION"
+            echo "CANDIDATE_URL=$CANDIDATE_URL"
+          } >> "$GITHUB_ENV"
+          {
+            echo "candidate_revision=$CANDIDATE_REVISION"
+            echo "candidate_url=$CANDIDATE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint canonical-audience identity token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IDENTITY_TOKEN="$(gcloud auth print-identity-token --audiences="$SERVICE_URL")"
+          echo "::add-mask::$IDENTITY_TOKEN"
+          echo "CLOUD_RUN_ID_TOKEN=$IDENTITY_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Smoke candidate route
+        id: candidate_smoke
+        timeout-minutes: 3
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          python scripts/smoke_cloud_run.py --service-url="$CANDIDATE_URL"
+
+      - name: Reserve post-promotion rollback window
+        id: promotion_gate
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NOW_EPOCH="$(date +%s)"
+          if (( NOW_EPOCH >= PROMOTION_CUTOFF_EPOCH )); then
+            echo "::error::Promotion cutoff reached; production traffic remains unchanged"
+            exit 1
+          fi
+          ROLLBACK_RESERVE_SECONDS="$((DEPLOYMENT_STARTED_EPOCH + 3600 - NOW_EPOCH))"
+          echo "rollback_reserve_seconds=$ROLLBACK_RESERVE_SECONDS" >> "$GITHUB_OUTPUT"
+
+      - name: Promote candidate revision to 100 percent
+        id: promote
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
+
+          PROMOTION_COMMAND_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$CANDIDATE_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            PROMOTION_COMMAND_OUTCOME="success"
+          else
+            PROMOTION_COMMAND_STATUS=$?
+            PROMOTION_COMMAND_OUTCOME="exit-$PROMOTION_COMMAND_STATUS"
+          fi
+
+          PROMOTION_TRAFFIC_STATE="ambiguous"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"; then
+            if OBSERVED_TRAFFIC_STATE="$(
+              SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+                CANDIDATE_REVISION="$CANDIDATE_REVISION" \
+                python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          ordinary = [entry for entry in traffic if not entry.get("tag")]
+
+          def exclusively_serves(revision):
+              return (
+                  len(ordinary) == 1
+                  and ordinary[0].get("revisionName") == revision
+                  and int(ordinary[0].get("percent", 0) or 0) == 100
+              )
+
+          if exclusively_serves(os.environ["CANDIDATE_REVISION"]):
+              print("candidate-100")
+          else:
+              print("ambiguous")
+          PY
+            )"; then
+              PROMOTION_TRAFFIC_STATE="$OBSERVED_TRAFFIC_STATE"
+            fi
+          fi
+
+          if [[ "$PROMOTION_TRAFFIC_STATE" != "candidate-100" ]]; then
+            PROMOTION_TRAFFIC_STATE="ambiguous"
+          fi
+
+          {
+            echo "PROMOTION_COMMAND_OUTCOME=$PROMOTION_COMMAND_OUTCOME"
+            echo "PROMOTION_TRAFFIC_STATE=$PROMOTION_TRAFFIC_STATE"
+          } >> "$GITHUB_ENV"
+          {
+            echo "command_outcome=$PROMOTION_COMMAND_OUTCOME"
+            echo "traffic_state=$PROMOTION_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          case "$PROMOTION_TRAFFIC_STATE" in
+            candidate-100)
+              echo "FINAL_SERVING_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
+              ;;
+            ambiguous)
+              echo "::error::Promotion command outcome was $PROMOTION_COMMAND_OUTCOME; candidate traffic is not confirmed and rollback is armed"
+              ;;
+          esac
+
+      - name: Fail ambiguous promotion reconciliation
+        id: promotion_reconciliation
+        if: steps.promote.outputs.traffic_state == 'ambiguous'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          echo "::error::Promotion state is ambiguous; triggering traffic rollback"
+          exit 1
+
+      - name: Verify promoted traffic
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"
+          SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+            CANDIDATE_REVISION="$CANDIDATE_REVISION" \
+            python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          promoted = [
+              entry
+              for entry in traffic
+              if not entry.get("tag")
+              and entry.get("revisionName") == os.environ["CANDIDATE_REVISION"]
+              and int(entry.get("percent", 0) or 0) == 100
+          ]
+          if len(promoted) != 1:
+              raise SystemExit("candidate revision does not have 100% ordinary traffic")
+          PY
+          echo "FINAL_SERVING_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
+
+      - name: Smoke canonical route
+        id: canonical_smoke
+        timeout-minutes: 3
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          python scripts/smoke_cloud_run.py --service-url="$SERVICE_URL"
+
+      - name: Remove temporary candidate traffic tag
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          timeout --signal=TERM --kill-after=10s 60s \
+            gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+              --remove-tags="$CANDIDATE_TAG" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --quiet
+
+      - name: Require service IAM to remain private
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IAM_POLICY_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services get-iam-policy "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"
+          IAM_POLICY_JSON="$IAM_POLICY_JSON" python - <<'PY'
+          import json
+          import os
+
+          policy = json.loads(os.environ["IAM_POLICY_JSON"])
+          public_members = {"allUsers", "allAuthenticatedUsers"}
+          members = {
+              member
+              for binding in policy.get("bindings", [])
+              for member in binding.get("members", [])
+          }
+          exposed = sorted(public_members & members)
+          if exposed:
+              raise SystemExit(f"Cloud Run service became public: {', '.join(exposed)}")
+          PY
+
+      - name: Roll back production traffic after post-promotion failure
+        id: rollback
+        if: failure() && steps.promote.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
+
+          ROLLBACK_COMMAND_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$PREVIOUS_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            ROLLBACK_COMMAND_OUTCOME="success"
+          else
+            ROLLBACK_COMMAND_STATUS=$?
+            ROLLBACK_COMMAND_OUTCOME="exit-$ROLLBACK_COMMAND_STATUS"
+          fi
+
+          ROLLBACK_TRAFFIC_STATE="unknown"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"; then
+            if SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+              PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+              python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          restored = [
+              entry
+              for entry in traffic
+              if not entry.get("tag")
+              and entry.get("revisionName") == os.environ["PREVIOUS_REVISION"]
+              and int(entry.get("percent", 0) or 0) == 100
+          ]
+          if len(restored) != 1:
+              raise SystemExit("rollback did not restore the previous revision to 100%")
+          PY
+            then
+              ROLLBACK_TRAFFIC_STATE="previous-100"
+            fi
+          fi
+
+          {
+            echo "command_outcome=$ROLLBACK_COMMAND_OUTCOME"
+            echo "traffic_state=$ROLLBACK_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$ROLLBACK_TRAFFIC_STATE" != "previous-100" ]]; then
+            echo "::error::Rollback command outcome was $ROLLBACK_COMMAND_OUTCOME; final serving revision is unknown"
+            exit 1
+          fi
+          echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+      - name: Best-effort traffic rollback on cancellation
+        id: cancellation_rollback
+        if: cancelled() && steps.promotion_gate.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "FINAL_SERVING_REVISION=unknown" >> "$GITHUB_ENV"
+
+          CANCELLATION_ROLLBACK_STATUS=0
+          if timeout --signal=TERM --kill-after=10s 180s \
+            gcloud run services update-traffic fraud-risk-api \
+              --to-revisions="$PREVIOUS_REVISION=100" \
+              --region=europe-west1 \
+              --project=fraud-risk-engine \
+              --quiet; then
+            CANCELLATION_ROLLBACK_OUTCOME="success"
+          else
+            CANCELLATION_ROLLBACK_STATUS=$?
+            CANCELLATION_ROLLBACK_OUTCOME="exit-$CANCELLATION_ROLLBACK_STATUS"
+          fi
+
+          CANCELLATION_TRAFFIC_STATE="unknown"
+          if SERVICE_STATE_JSON="$(
+            timeout --signal=TERM --kill-after=10s 60s \
+              gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT_ID" \
+              --platform=managed \
+              --format=json
+          )"; then
+            if SERVICE_STATE_JSON="$SERVICE_STATE_JSON" \
+              PREVIOUS_REVISION="$PREVIOUS_REVISION" \
+              python - <<'PY'
+          import json
+          import os
+
+          state = json.loads(os.environ["SERVICE_STATE_JSON"])
+          traffic = state.get("status", {}).get("traffic", [])
+          restored = [
+              entry
+              for entry in traffic
+              if not entry.get("tag")
+              and entry.get("revisionName") == os.environ["PREVIOUS_REVISION"]
+              and int(entry.get("percent", 0) or 0) == 100
+          ]
+          if len(restored) != 1:
+              raise SystemExit("cancellation rollback did not restore the previous revision")
+          PY
+            then
+              CANCELLATION_TRAFFIC_STATE="previous-100"
+            fi
+          fi
+
+          {
+            echo "command_outcome=$CANCELLATION_ROLLBACK_OUTCOME"
+            echo "traffic_state=$CANCELLATION_TRAFFIC_STATE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$CANCELLATION_TRAFFIC_STATE" != "previous-100" ]]; then
+            echo "::error::Cancellation rollback outcome was $CANCELLATION_ROLLBACK_OUTCOME; final serving revision is unknown"
+            exit 1
+          fi
+          echo "FINAL_SERVING_REVISION=$PREVIOUS_REVISION" >> "$GITHUB_ENV"
+
+      - name: Write deployment summary
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          CANDIDATE_SMOKE_OUTCOME: ${{ steps.candidate_smoke.outcome }}
+          CANONICAL_SMOKE_OUTCOME: ${{ steps.canonical_smoke.outcome }}
+          PROMOTION_OUTCOME: ${{ steps.promote.outcome }}
+          PROMOTION_COMMAND_OUTCOME: ${{ steps.promote.outputs.command_outcome }}
+          PROMOTION_TRAFFIC_STATE: ${{ steps.promote.outputs.traffic_state }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          CANCELLATION_ROLLBACK_OUTCOME: ${{ steps.cancellation_rollback.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$CANDIDATE_SMOKE_OUTCOME" == "success" && "$CANONICAL_SMOKE_OUTCOME" == "success" ]]; then
+            SMOKE_CONCLUSION="candidate and canonical smoke passed"
+          elif [[ "$CANDIDATE_SMOKE_OUTCOME" == "failure" ]]; then
+            SMOKE_CONCLUSION="candidate smoke failed"
+          elif [[ "$CANONICAL_SMOKE_OUTCOME" == "failure" ]]; then
+            SMOKE_CONCLUSION="canonical smoke failed"
+          else
+            SMOKE_CONCLUSION="smoke checks did not complete"
+          fi
+
+          {
+            echo "## Production deployment"
+            echo
+            echo "- Git SHA: \`${GITHUB_SHA}\`"
+            echo "- Model release: \`${MODEL_RELEASE}\`"
+            echo "- Model version: \`${MODEL_VERSION}\`"
+            echo "- Image tag: \`${IMAGE_TAG:-not-created}\`"
+            echo "- Image digest: \`${DIGEST:-not-resolved}\`"
+            echo "- Previous revision: \`${PREVIOUS_REVISION:-not-recorded}\`"
+            echo "- Candidate revision: \`${CANDIDATE_REVISION:-not-created}\`"
+            echo "- Final serving revision: \`${FINAL_SERVING_REVISION:-not-recorded}\`"
+            echo "- Smoke conclusion: ${SMOKE_CONCLUSION}"
+            echo "- Promotion outcome: ${PROMOTION_OUTCOME:-not-run}"
+            echo "- Promotion command outcome: ${PROMOTION_COMMAND_OUTCOME:-not-run}"
+            echo "- Promotion traffic state: ${PROMOTION_TRAFFIC_STATE:-not-observed}"
+            echo "- Rollback outcome: ${ROLLBACK_OUTCOME:-not-run}"
+            echo "- Cancellation rollback outcome: ${CANCELLATION_ROLLBACK_OUTCOME:-not-run}"
+          } >> "$GITHUB_STEP_SUMMARY"
