@@ -2,9 +2,11 @@
 
 import argparse
 import json
+import math
 import os
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 
 class SmokeCheckError(RuntimeError):
@@ -81,26 +83,31 @@ EXPECTED_NEGATIVE_PROBABILITY = 0.13046391308307648
 EXPECTED_POSITIVE_PROBABILITY = 0.9620175957679749
 
 
-def _read_response(response):
-    body = response.read()
-    return json.loads(body.decode("utf-8")) if body else None
+def _read_response(response, endpoint):
+    try:
+        body = response.read()
+        return json.loads(body.decode("utf-8")) if body else None
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SmokeCheckError(f"{endpoint} returned malformed response") from error
 
 
-def _request(service_url, path, token, opener, payload=None):
+def _request(service_url, path, token, opener, payload=None, parse_body=True):
     headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = Request(f"{service_url.rstrip('/')}{path}", data=data, headers=headers)
+    if token:
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         response = opener(request)
     except HTTPError as error:
-        return error.code, _read_response(error)
+        return error.code, None
+    except URLError as error:
+        raise SmokeCheckError(f"{path} request failed") from error
     with response:
-        return response.status, _read_response(response)
+        return response.status, _read_response(response, path) if parse_body else None
 
 
 def _require_response(status, body, expected_status, expected_body, endpoint):
@@ -108,17 +115,30 @@ def _require_response(status, body, expected_status, expected_body, endpoint):
         raise SmokeCheckError(
             f"{endpoint} returned status {status}; expected {expected_status}"
         )
+    if not isinstance(body, dict):
+        raise SmokeCheckError(f"{endpoint} returned malformed response")
     if body != expected_body:
         raise SmokeCheckError(f"{endpoint} returned an unexpected response body")
 
 
-def _verify_prediction(body, expected_probability, expected_classification, tolerance):
-    if body.get("threshold") != 0.9:
+def _is_finite_number(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _verify_prediction(body, expected_probability, expected_classification, tolerance, label):
+    if not isinstance(body, dict):
+        raise SmokeCheckError(f"{label} returned malformed response")
+    threshold = body.get("threshold")
+    if not _is_finite_number(threshold) or threshold != 0.9:
         raise SmokeCheckError("prediction returned an unexpected threshold")
     if body.get("is_fraud") is not expected_classification:
         raise SmokeCheckError("prediction returned an unexpected classification")
     probability = body.get("fraud_probability")
-    if not isinstance(probability, (int, float)):
+    if not _is_finite_number(probability):
         raise SmokeCheckError("prediction returned an invalid probability")
     difference = abs(probability - expected_probability)
     if difference > tolerance:
@@ -128,7 +148,11 @@ def _verify_prediction(body, expected_probability, expected_classification, tole
 
 def run_smoke_tests(service_url: str, identity_token: str, opener=urlopen) -> dict:
     """Check the private service health, readiness, and two stable predictions."""
-    status, _ = _request(service_url, "/health", None, opener)
+    parsed_service_url = urlsplit(service_url)
+    if parsed_service_url.scheme != "https" or not parsed_service_url.netloc:
+        raise SmokeCheckError("service URL must use HTTPS")
+
+    status, _ = _request(service_url, "/health", None, opener, parse_body=False)
     if status != 403:
         raise SmokeCheckError(
             f"unauthenticated /health returned status {status}; expected 403"
@@ -146,7 +170,7 @@ def run_smoke_tests(service_url: str, identity_token: str, opener=urlopen) -> di
     if negative_status != 200:
         raise SmokeCheckError(f"negative prediction returned status {negative_status}")
     negative_probability, negative_difference = _verify_prediction(
-        negative_body, EXPECTED_NEGATIVE_PROBABILITY, False, 1e-7
+        negative_body, EXPECTED_NEGATIVE_PROBABILITY, False, 1e-7, "negative prediction"
     )
 
     positive_status, positive_body = _request(
@@ -155,7 +179,7 @@ def run_smoke_tests(service_url: str, identity_token: str, opener=urlopen) -> di
     if positive_status != 200:
         raise SmokeCheckError(f"positive prediction returned status {positive_status}")
     positive_probability, positive_difference = _verify_prediction(
-        positive_body, EXPECTED_POSITIVE_PROBABILITY, True, 1e-6
+        positive_body, EXPECTED_POSITIVE_PROBABILITY, True, 1e-6, "positive prediction"
     )
 
     return {

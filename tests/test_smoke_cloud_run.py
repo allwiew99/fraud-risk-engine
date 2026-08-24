@@ -1,4 +1,7 @@
+import io
 import json
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler
 
 import pytest
 
@@ -32,6 +35,15 @@ class FakeResponse:
         return False
 
 
+class RawFakeResponse(FakeResponse):
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def read(self):
+        return self._body
+
+
 class FakeOpener:
     def __init__(self, responses):
         self._responses = iter(responses)
@@ -43,9 +55,18 @@ class FakeOpener:
                 "url": request.full_url,
                 "method": request.get_method(),
                 "has_authorization": request.has_header("Authorization"),
+                "has_unredirected_authorization": (
+                    "Authorization" in request.unredirected_hdrs
+                ),
+                "has_regular_authorization": "Authorization" in request.headers,
             }
         )
-        status, body = next(self._responses)
+        response = next(self._responses)
+        if isinstance(response, BaseException):
+            raise response
+        if isinstance(response, FakeResponse):
+            return response
+        status, body = response
         return FakeResponse(status, body)
 
 
@@ -71,6 +92,8 @@ def test_smoke_requires_unauthenticated_health_to_be_403():
             "url": "https://service.example/health",
             "method": "GET",
             "has_authorization": False,
+            "has_unredirected_authorization": False,
+            "has_regular_authorization": False,
         }
     ]
 
@@ -88,16 +111,22 @@ def test_smoke_accepts_expected_health_and_readiness():
             "url": "https://service.example/health",
             "method": "GET",
             "has_authorization": False,
+            "has_unredirected_authorization": False,
+            "has_regular_authorization": False,
         },
         {
             "url": "https://service.example/health",
             "method": "GET",
             "has_authorization": True,
+            "has_unredirected_authorization": True,
+            "has_regular_authorization": False,
         },
         {
             "url": "https://service.example/ready",
             "method": "GET",
             "has_authorization": True,
+            "has_unredirected_authorization": True,
+            "has_regular_authorization": False,
         },
     ]
 
@@ -117,11 +146,15 @@ def test_smoke_accepts_both_known_prediction_contracts():
             "url": "https://service.example/predict",
             "method": "POST",
             "has_authorization": True,
+            "has_unredirected_authorization": True,
+            "has_regular_authorization": False,
         },
         {
             "url": "https://service.example/predict",
             "method": "POST",
             "has_authorization": True,
+            "has_unredirected_authorization": True,
+            "has_regular_authorization": False,
         },
     ]
     serialized_result = json.dumps(result, sort_keys=True)
@@ -144,3 +177,149 @@ def test_smoke_rejects_probability_or_classification_mismatch():
 
     with pytest.raises(SmokeCheckError):
         run_smoke_tests("https://service.example", "test-token", opener)
+
+
+def test_smoke_continues_after_plain_text_unauthenticated_http_error():
+    # Parsing a gateway's plain-text denial must not mask its required 403 status.
+    denial = HTTPError(
+        "https://service.example/health",
+        403,
+        "Forbidden",
+        None,
+        io.BytesIO(b"access denied"),
+    )
+    opener = FakeOpener([denial, *successful_responses()[1:]])
+
+    result = run_smoke_tests("https://service.example", "test-token", opener)
+
+    assert result["health"] == 200
+    assert result["ready"] == 200
+
+
+def test_smoke_rejects_unexpected_unauthenticated_http_error():
+    # HTTP failures other than the expected private-service denial are not success.
+    failure = HTTPError(
+        "https://service.example/health",
+        500,
+        "Internal Server Error",
+        None,
+        io.BytesIO(b"untrusted response"),
+    )
+    opener = FakeOpener([failure])
+
+    with pytest.raises(SmokeCheckError):
+        run_smoke_tests("https://service.example", "test-token", opener)
+
+
+def test_smoke_requires_an_https_service_url():
+    # A caller selecting cleartext transport must fail before any HTTP request.
+    opener = FakeOpener([])
+
+    with pytest.raises(SmokeCheckError):
+        run_smoke_tests("http://service.example", "test-token", opener)
+
+    assert opener.calls == []
+
+
+def test_smoke_does_not_send_authorization_on_cross_origin_redirect():
+    # Replacing an unredirected header with a regular header would leak it here.
+    class RedirectInspectingOpener(FakeOpener):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.redirected_request = None
+
+        def __call__(self, request):
+            response = super().__call__(request)
+            if request.has_header("Authorization") and self.redirected_request is None:
+                self.redirected_request = HTTPRedirectHandler().redirect_request(
+                    request,
+                    response,
+                    302,
+                    "Found",
+                    {"Location": "https://other.example/redirected"},
+                    "https://other.example/redirected",
+                )
+            return response
+
+    opener = RedirectInspectingOpener(successful_responses())
+
+    run_smoke_tests("https://service.example", "test-token", opener)
+
+    assert opener.redirected_request is not None
+    assert opener.redirected_request.full_url == "https://other.example/redirected"
+    assert not opener.redirected_request.has_header("Authorization")
+
+
+@pytest.mark.parametrize("invalid_value", [float("nan"), float("inf"), float("-inf"), True])
+def test_smoke_rejects_non_finite_or_boolean_probability(invalid_value):
+    # Non-finite and boolean values are not valid measured probabilities.
+    responses = successful_responses()
+    responses[3] = (
+        200,
+        {"fraud_probability": invalid_value, "is_fraud": False, "threshold": 0.9},
+    )
+    opener = FakeOpener(responses)
+
+    with pytest.raises(SmokeCheckError):
+        run_smoke_tests("https://service.example", "test-token", opener)
+
+
+def test_smoke_rejects_out_of_tolerance_probability():
+    # A finite prediction beyond tolerance must not be accepted as equivalent.
+    responses = successful_responses()
+    responses[3] = (
+        200,
+        {
+            "fraud_probability": 0.13047391308307648,
+            "is_fraud": False,
+            "threshold": 0.9,
+        },
+    )
+    opener = FakeOpener(responses)
+
+    with pytest.raises(SmokeCheckError):
+        run_smoke_tests("https://service.example", "test-token", opener)
+
+
+@pytest.mark.parametrize("invalid_value", [float("nan"), float("inf"), float("-inf"), True])
+def test_smoke_rejects_non_finite_or_boolean_threshold(invalid_value):
+    # Threshold validation must use the same real finite-number rule.
+    responses = successful_responses()
+    responses[3] = (
+        200,
+        {
+            "fraud_probability": NEGATIVE_PREDICTION["fraud_probability"],
+            "is_fraud": False,
+            "threshold": invalid_value,
+        },
+    )
+    opener = FakeOpener(responses)
+
+    with pytest.raises(SmokeCheckError):
+        run_smoke_tests("https://service.example", "test-token", opener)
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_message"),
+    [
+        (RawFakeResponse(200, b"<html>untrusted response</html>"), "/health returned malformed response"),
+        (RawFakeResponse(200, b"\xff"), "/health returned malformed response"),
+        ((200, ["untrusted response"]), "negative prediction returned malformed response"),
+    ],
+)
+def test_smoke_normalizes_malformed_bodies_to_safe_errors(response, expected_message):
+    # Raw response data and request details must never escape in error messages.
+    responses = successful_responses()
+    if isinstance(response, tuple):
+        responses[3] = response
+    else:
+        responses[1] = response
+    opener = FakeOpener(responses)
+
+    with pytest.raises(SmokeCheckError) as error:
+        run_smoke_tests("https://service.example", "test-token", opener)
+
+    assert str(error.value) == expected_message
+    assert "untrusted response" not in str(error.value)
+    assert "test-token" not in str(error.value)
+    assert "income" not in str(error.value)
