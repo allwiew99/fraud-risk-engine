@@ -511,13 +511,19 @@ jobs:
 
           state = json.loads(os.environ["SERVICE_STATE_JSON"])
           traffic = state.get("status", {}).get("traffic", [])
-          ordinary = [entry for entry in traffic if not entry.get("tag")]
+          positive_traffic_entries = [
+              entry
+              for entry in traffic
+              if int(entry.get("percent", 0) or 0) > 0
+          ]
 
           def exclusively_serves(revision):
               return (
-                  len(ordinary) == 1
-                  and ordinary[0].get("revisionName") == revision
-                  and int(ordinary[0].get("percent", 0) or 0) == 100
+                  len(positive_traffic_entries) == 1
+                  and positive_traffic_entries[0].get("revisionName") == revision
+                  and int(
+                      positive_traffic_entries[0].get("percent", 0) or 0
+                  ) == 100
               )
 
           if exclusively_serves(os.environ["CANDIDATE_REVISION"]):
@@ -583,15 +589,21 @@ jobs:
 
           state = json.loads(os.environ["SERVICE_STATE_JSON"])
           traffic = state.get("status", {}).get("traffic", [])
-          promoted = [
+          positive_traffic_entries = [
               entry
               for entry in traffic
-              if not entry.get("tag")
-              and entry.get("revisionName") == os.environ["CANDIDATE_REVISION"]
-              and int(entry.get("percent", 0) or 0) == 100
+              if int(entry.get("percent", 0) or 0) > 0
           ]
-          if len(promoted) != 1:
-              raise SystemExit("candidate revision does not have 100% ordinary traffic")
+          promoted = (
+              len(positive_traffic_entries) == 1
+              and positive_traffic_entries[0].get("revisionName")
+              == os.environ["CANDIDATE_REVISION"]
+              and int(
+                  positive_traffic_entries[0].get("percent", 0) or 0
+              ) == 100
+          )
+          if not promoted:
+              raise SystemExit("candidate revision is not the sole 100% traffic allocation")
           PY
           echo "FINAL_SERVING_REVISION=$CANDIDATE_REVISION" >> "$GITHUB_ENV"
 
