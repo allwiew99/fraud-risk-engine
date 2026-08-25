@@ -52,6 +52,51 @@ def _service_state(*, latest: str, traffic: object) -> dict:
     }
 
 
+def test_cloud_run_identity_tokens_are_minted_by_pinned_wif_action():
+    workflow = WORKFLOW_PATH.read_text()
+
+    assert "gcloud auth print-identity-token" not in workflow
+    assert workflow.count("token_format: id_token") == 2
+    assert (
+        workflow.count(
+            "id_token_audience: "
+            "${{ steps.service_preflight.outputs.service_url }}"
+        )
+        == 2
+    )
+    assert workflow.count("create_credentials_file: false") == 2
+    assert workflow.count("export_environment_variables: false") == 2
+    assert "id: candidate_auth" in workflow
+    assert "id: canonical_auth" in workflow
+
+
+def test_identity_token_flow_preserves_wif_and_never_logs_credentials():
+    workflow = WORKFLOW_PATH.read_text()
+
+    assert "id-token: write" in workflow
+    assert workflow.count("${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}") == 3
+    assert (
+        workflow.count(
+            "service_account: ${{ env.GCP_DEPLOYER_SERVICE_ACCOUNT }}"
+        )
+        == 3
+    )
+    assert "credentials_json:" not in workflow
+    assert "${{ secrets." not in workflow
+    assert "IDENTITY_TOKEN=" not in workflow
+    assert "CLOUD_RUN_ID_TOKEN=" not in workflow
+    assert (
+        "CLOUD_RUN_ID_TOKEN: ${{ steps.candidate_auth.outputs.id_token }}"
+        in workflow
+    )
+    assert (
+        "CLOUD_RUN_ID_TOKEN: ${{ steps.canonical_auth.outputs.id_token }}"
+        in workflow
+    )
+    assert "--service-url=\"$CANDIDATE_URL\"" in workflow
+    assert "--service-url=\"$SERVICE_URL\"" in workflow
+
+
 def test_preflight_selects_sole_ordinary_serving_revision_not_failed_latest():
     state = _service_state(
         latest="rev-failed",
