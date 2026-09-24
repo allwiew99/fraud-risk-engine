@@ -77,13 +77,12 @@ once, resolved to an immutable Artifact Registry digest, and deployed by that
 digest.
 
 Live-state note (verified 2026-09-24): production serves private Cloud Run
-revision `fraud-risk-api-00006-zaq` at 100% ordinary traffic. Its deployed image
+revision `fraud-risk-api-00009-hiz` at 100% ordinary traffic. Its deployed image
 index digest is
-`sha256:1ed0f5613452ddd3c83a396f5c2d4b3f3f1817a0882a1e2e4a72c5d85eae133c`;
+`sha256:fbd2d8c5b81c788c75b093de6e64990f41c8f2e33ca018b28cafcdc03ad523fb`;
 Cloud Run imported linux/amd64 manifest digest
-`sha256:f83c3f2f74e62a846ade5381b8049cc19b0c02e72444493700d70f4e3a9e3dcc`.
-That revision serves the approved release above. See `PRODUCTION_READINESS.md`
-for the distinction between current live evidence and the pending audit rollout.
+`sha256:deaea0658abfac04c7a9b43a1822b7d488e621780e6bfcd7001590f16a126ad3`.
+That revision serves the approved release above with revision maximum 3.
 
 ## 5. Production architecture
 
@@ -158,9 +157,8 @@ and artifacts are local-only.
 
 `.github/workflows/deploy.yml` is a separate `workflow_dispatch` workflow for
 `main`. WIF, the scoped deployer account, and both GitHub variables are live.
-Deployment run `32854613397` completed the first automated rollout from
-`a1615f6` on 2026-08-25; the current audit revision is documented separately
-until its own rollout completes.
+Deployment run `36031500249` completed the audited rollout from main commit
+`63f407827d3979d0345e899761a6755abb327c6a` on 2026-09-24.
 
 For an authorized dispatch, the workflow:
 
@@ -239,9 +237,10 @@ fixed safe message.
 Request payloads, feature names/values, fraud probabilities, tokens,
 credentials, and unknown fields are not serialized. Exception text is also
 excluded because a library message could contain input-derived content. The
-implementation is deployed, but fresh application-event evidence had aged out
-of the available retention window at the 2026-09-24 audit; live observability
-therefore remains partial until the audit rollout produces new events.
+implementation is deployed. Cloud Logging for revision
+`fraud-risk-api-00009-hiz` contains a `model_startup` event with release/model
+identity and fresh `prediction_completed` events from candidate/canonical smoke
+and load activity.
 
 Cloud Run supplies request count, latency, instance count, CPU, and memory
 metrics. The tracked policy defines a `5xx / total requests > 5%` condition for
@@ -349,6 +348,8 @@ creation order and do not delete failed revisions automatically.
   and workflow dispatch.
 - Training data, notebook outputs, MLflow tracking state, and model artifacts
   remain local-only and are intentionally excluded from Git.
+- The short warm load test peaked at about 205 RPS at concurrency 25; the
+  reproducible measurements and their limitations are in `LOAD_TEST_RESULTS.md`.
 - GitHub repository secret scanning is disabled; local tracked-file scanning
   and zero user-managed service-account keys are the current evidence.
 - Bounded workflow operations reduce ambiguity but cannot guarantee rollback
