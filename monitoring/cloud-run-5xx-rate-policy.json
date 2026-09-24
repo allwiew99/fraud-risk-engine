@@ -3,9 +3,12 @@
   "combiner": "OR",
   "enabled": true,
   "documentation": {
-    "content": "The fraud-risk-api 5xx ratio exceeded 5% for five minutes. Inspect the latest Cloud Run revision, structured model_startup/model_startup_failed events, and request logs. No notification channel is configured; incidents are visible in Cloud Monitoring.",
+    "content": "The fraud-risk-api 5xx ratio exceeded 5% for five minutes. Inspect the latest Cloud Run revision, structured model_startup/model_startup_failed events, and request logs. The production owner email notification channel is attached.",
     "mimeType": "text/markdown"
   },
+  "notificationChannels": [
+    "projects/fraud-risk-engine/notificationChannels/7232674366703482783"
+  ],
   "conditions": [
     {
       "displayName": "5xx responses exceed 5% for 5 minutes",
