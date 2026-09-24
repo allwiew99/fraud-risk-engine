@@ -365,8 +365,8 @@ jobs:
             --set-env-vars="MODEL_ARTIFACT_URI=$MODEL_ARTIFACT_URI" \
             --cpu=1 \
             --memory=1Gi \
-            --min=0 \
-            --max=3 \
+            --min-instances=0 \
+            --max-instances=3 \
             --concurrency=4 \
             --timeout=60 \
             --cpu-boost \
@@ -424,6 +424,43 @@ jobs:
           ]
           if len(previous_entries) != 1:
               raise SystemExit("previous revision no longer has 100% ordinary traffic")
+
+          template = state.get("spec", {}).get("template", {})
+          annotations = template.get("metadata", {}).get("annotations", {})
+          if annotations.get("autoscaling.knative.dev/maxScale") != "3":
+              raise SystemExit("candidate maximum instance count is not 3")
+          if annotations.get("autoscaling.knative.dev/minScale", "0") != "0":
+              raise SystemExit("candidate minimum instance count is not 0")
+
+          revision_spec = template.get("spec", {})
+          if revision_spec.get("serviceAccountName") != os.environ["RUNTIME_SERVICE_ACCOUNT"]:
+              raise SystemExit("candidate runtime service account is incorrect")
+          if revision_spec.get("containerConcurrency") != 4:
+              raise SystemExit("candidate concurrency is not 4")
+          if revision_spec.get("timeoutSeconds") != 60:
+              raise SystemExit("candidate timeout is not 60 seconds")
+
+          containers = revision_spec.get("containers", [])
+          if not isinstance(containers, list) or len(containers) != 1:
+              raise SystemExit("candidate must contain exactly one container")
+          container = containers[0]
+          expected_image = f'{os.environ["IMAGE"]}@{os.environ["DIGEST"]}'
+          if container.get("image") != expected_image:
+              raise SystemExit("candidate image digest is incorrect")
+          if container.get("resources", {}).get("limits") != {
+              "cpu": "1",
+              "memory": "1Gi",
+          }:
+              raise SystemExit("candidate resource limits are incorrect")
+          environment = {
+              entry.get("name"): entry.get("value")
+              for entry in container.get("env", [])
+              if isinstance(entry, dict)
+          }
+          if environment != {
+              "MODEL_ARTIFACT_URI": os.environ["MODEL_ARTIFACT_URI"]
+          }:
+              raise SystemExit("candidate model artifact URI is incorrect")
           print(f"{candidate_revision}\t{candidate_url}")
           PY
           )"
