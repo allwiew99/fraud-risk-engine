@@ -46,6 +46,7 @@ where = ["src"]
 testpaths = [
     "tests/test_api.py",
     "tests/test_deploy_workflow.py",
+    "tests/test_load_test.py",
     "tests/test_model_service.py",
     "tests/test_observability.py",
     "tests/test_release_manifest.py",
