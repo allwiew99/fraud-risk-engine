@@ -8,8 +8,7 @@ from pydantic import (
     model_validator,
 )
 
-
-MANIFEST_VERSION = "1"
+MANIFEST_VERSION: Literal["1"] = "1"
 PREPROCESSOR_FILENAME = "xgb_preprocessor.joblib"
 MODEL_FILENAME = "xgb_champion.ubj"
 REQUIRED_ARTIFACTS = frozenset(

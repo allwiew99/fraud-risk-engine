@@ -1,16 +1,17 @@
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
-
 
 WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github/workflows/deploy.yml"
 )
+CI_WORKFLOW_PATH = WORKFLOW_PATH.with_name("ci.yml")
+PROJECT_PATH = WORKFLOW_PATH.parents[2] / "pyproject.toml"
 SERVICE_URL = "https://fraud-risk-api.example.run.app"
 
 
@@ -112,6 +113,19 @@ def test_cloud_run_identity_tokens_are_minted_by_pinned_wif_action():
     assert workflow.count("export_environment_variables: false") == 2
     assert "id: candidate_auth" in workflow
     assert "id: canonical_auth" in workflow
+
+
+def test_ci_and_deploy_run_static_quality_gates():
+    ci_workflow = CI_WORKFLOW_PATH.read_text()
+    deploy_workflow = WORKFLOW_PATH.read_text()
+    project = PROJECT_PATH.read_text()
+
+    assert '"ruff==' in project
+    assert '"mypy==' in project
+    assert "python -m ruff check ." in ci_workflow
+    assert "python -m mypy src scripts" in ci_workflow
+    assert "python -m ruff check ." in deploy_workflow
+    assert "python -m mypy src scripts" in deploy_workflow
 
 
 def test_identity_token_flow_preserves_wif_and_never_logs_credentials():

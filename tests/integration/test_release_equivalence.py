@@ -7,7 +7,6 @@ from fraud_risk.config import MLFLOW_TRACKING_URI, MODEL_URI
 from fraud_risk.model_bundle import load_model_bundle
 from fraud_risk.release_export import export_champion_release
 
-
 pytestmark = pytest.mark.integration
 
 

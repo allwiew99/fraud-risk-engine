@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from fraud_risk.observability import JsonFormatter, release_name_from_uri
 from fraud_risk.schemas import FraudPredictionRequest
 
-
 PRODUCTION_MODEL_ARTIFACT_URI = (
     "gs://fraud-risk-engine-models/releases/v2-3e65f5fd-88b81f0/"
 )

@@ -13,7 +13,6 @@ from fraud_risk.model_bundle import (
     load_model_bundle,
     verify_model_bundle,
 )
-
 from tests.test_release_manifest import FEATURES, valid_manifest_data
 
 

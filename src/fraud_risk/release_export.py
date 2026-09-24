@@ -1,12 +1,12 @@
-from dataclasses import dataclass
-from datetime import UTC, datetime
 import hashlib
 import json
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fraud_risk.config import (
@@ -20,7 +20,6 @@ from fraud_risk.release_manifest import (
     ModelReleaseManifest,
 )
 from fraud_risk.schemas import FraudPredictionRequest
-
 
 MODEL_NAME = "fraud-risk-model"
 CHAMPION_ALIAS = "champion"
@@ -171,12 +170,15 @@ def export_champion_release(
         MODEL_NAME,
         CHAMPION_ALIAS,
     )
+    source_uri = model_version.source
+    if not source_uri:
+        raise RuntimeError("The resolved MLflow model has no source URI")
     resolved = ResolvedModelVersion(
         model_name=MODEL_NAME,
         model_version=str(model_version.version),
         mlflow_run_id=model_version.run_id,
-        mlflow_model_id=_model_id_from_source(model_version.source),
-        source_uri=model_version.source,
+        mlflow_model_id=_model_id_from_source(source_uri),
+        source_uri=source_uri,
     )
     downloaded_path = Path(
         mlflow.artifacts.download_artifacts(

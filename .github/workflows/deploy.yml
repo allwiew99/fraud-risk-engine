@@ -102,8 +102,11 @@ jobs:
           python -m pip install --upgrade pip setuptools
           python -m pip install --editable ".[dev]"
 
-      - name: Run default test suite
-        run: PYTHONPATH=src python -m pytest -q
+      - name: Run static checks and default test suite
+        run: |
+          python -m ruff check .
+          python -m mypy src scripts
+          PYTHONPATH=src python -m pytest -q
 
       - name: Authenticate to Google Cloud with Workload Identity Federation
         id: auth

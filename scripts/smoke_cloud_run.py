@@ -6,8 +6,8 @@ import math
 import os
 import sys
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 
 class SmokeCheckError(RuntimeError):

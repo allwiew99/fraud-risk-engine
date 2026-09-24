@@ -4,7 +4,15 @@ PORT ?= 8080
 MODEL_RELEASE_DIR ?=
 MLFLOW_TRACKING_URI ?= http://127.0.0.1:5000
 
-.PHONY: test test-integration export-model-release docker-build docker-build-amd64 docker-run
+.PHONY: check lint typecheck test test-integration export-model-release docker-build docker-build-amd64 docker-run
+
+check: lint typecheck test
+
+lint:
+	PYTHONPATH=src $(PYTHON) -m ruff check .
+
+typecheck:
+	PYTHONPATH=src $(PYTHON) -m mypy src scripts
 
 test:
 	PYTHONPATH=src $(PYTHON) -m pytest -q

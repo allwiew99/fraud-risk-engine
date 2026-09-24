@@ -4,7 +4,6 @@ import pytest
 
 from fraud_risk.config import MLFLOW_TRACKING_URI, MODEL_URI
 
-
 pytestmark = pytest.mark.integration
 
 
