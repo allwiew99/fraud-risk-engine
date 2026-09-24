@@ -26,6 +26,11 @@ jobs:
           python -m pip install --upgrade pip setuptools
           python -m pip install --editable ".[dev]"
 
+      - name: Run static checks
+        run: |
+          python -m ruff check .
+          python -m mypy src scripts
+
       - name: Run fast tests
         run: PYTHONPATH=src python -m pytest -q
 

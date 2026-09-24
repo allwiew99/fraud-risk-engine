@@ -1,7 +1,7 @@
 import io
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler
 
@@ -9,7 +9,6 @@ import pytest
 
 import scripts.smoke_cloud_run as smoke_cloud_run
 from scripts.smoke_cloud_run import SmokeCheckError, run_smoke_tests
-
 
 NEGATIVE_PREDICTION = {
     "fraud_probability": 0.13046391308307648,

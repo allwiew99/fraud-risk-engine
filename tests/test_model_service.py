@@ -1,12 +1,11 @@
 import importlib
-from types import SimpleNamespace
 import sys
 import traceback
+from types import SimpleNamespace
 
 import pytest
 
 from fraud_risk.schemas import FraudPredictionRequest
-
 
 NEGATIVE_PAYLOAD = {
     "income": 0.9,

@@ -3,7 +3,6 @@ import logging
 import sys
 from urllib.parse import urlparse
 
-
 SAFE_EVENT_FIELDS = (
     "event",
     "model_version",
@@ -37,7 +36,7 @@ def configure_application_logging() -> logging.Logger:
     ):
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(JsonFormatter())
-        setattr(handler, "_fraud_risk_json", True)
+        handler._fraud_risk_json = True  # type: ignore[attr-defined]
         logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False

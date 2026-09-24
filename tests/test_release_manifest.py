@@ -3,7 +3,6 @@ from pydantic import ValidationError
 
 from fraud_risk.release_manifest import ModelReleaseManifest
 
-
 FEATURES = [
     "income",
     "name_email_similarity",

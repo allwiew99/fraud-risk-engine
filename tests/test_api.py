@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ import fraud_risk.model_service as model_service
 from fraud_risk.api import app
 from fraud_risk.observability import JsonFormatter
 from fraud_risk.schemas import FraudPredictionResponse
-
+from tests.test_model_service import NEGATIVE_PAYLOAD
 
 client = TestClient(app)
 
@@ -108,6 +109,44 @@ def test_predict_missing_required_field():
     response = client.post("/predict", json=payload)
 
     assert response.status_code == 422
+
+
+def test_predict_rejects_unknown_fields_before_inference(monkeypatch):
+    inference_called = False
+
+    def fake_predict_fraud(request):
+        nonlocal inference_called
+        inference_called = True
+
+    monkeypatch.setattr(api, "predict_fraud", fake_predict_fraud)
+    payload = {**NEGATIVE_PAYLOAD, "untrusted_override": "ignored?"}
+
+    response = client.post("/predict", json=payload)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid request"}
+    assert inference_called is False
+
+
+def test_predict_rejects_non_finite_fields_before_inference(monkeypatch):
+    inference_called = False
+
+    def fake_predict_fraud(request):
+        nonlocal inference_called
+        inference_called = True
+
+    monkeypatch.setattr(api, "predict_fraud", fake_predict_fraud)
+    payload = {**NEGATIVE_PAYLOAD, "income": float("nan")}
+
+    response = client.post(
+        "/predict",
+        content=json.dumps(payload, allow_nan=True),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid request"}
+    assert inference_called is False
 
 
 def test_predict_fraud_true(monkeypatch):

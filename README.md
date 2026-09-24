@@ -76,11 +76,14 @@ serving Git commit plus release name, labelled with both identities, pushed
 once, resolved to an immutable Artifact Registry digest, and deployed by that
 digest.
 
-Live-state note: production remains the existing private Cloud Run revision
-`fraud-risk-api-00001-l7q`. Its approved image index digest is
-`sha256:7e3319a126b12fc6d8daa4f784e6e965e35f8be28da8b00ac019fd0107921d32`.
-The deployment workflow and observability source in this branch have not been
-pushed or deployed, so this README does not claim that image is serving them.
+Live-state note (verified 2026-09-24): production serves private Cloud Run
+revision `fraud-risk-api-00006-zaq` at 100% ordinary traffic. Its deployed image
+index digest is
+`sha256:1ed0f5613452ddd3c83a396f5c2d4b3f3f1817a0882a1e2e4a72c5d85eae133c`;
+Cloud Run imported linux/amd64 manifest digest
+`sha256:f83c3f2f74e62a846ade5381b8049cc19b0c02e72444493700d70f4e3a9e3dcc`.
+That revision serves the approved release above. See `PRODUCTION_READINESS.md`
+for the distinction between current live evidence and the pending audit rollout.
 
 ## 5. Production architecture
 
@@ -143,21 +146,21 @@ version `2`. Those governed files are intentionally local and not distributed in
 checkout can run fast/default tests and build Docker, but cannot run real integration or export
 until the approved local state is restored.
 
-The already approved immutable production release is reused for the pending first automated
-rollout and must not be re-exported, overwritten, or regenerated merely for deployment.
+The approved immutable production release is reused for deployments and must
+not be re-exported, overwritten, or regenerated merely for deployment.
 
 ## 8. CI, integration, and manual deployment workflows
 
 The CI workflow runs on pushes and pull requests. It installs Python 3.14
-dependencies, runs the service-independent test suite, and builds the Docker
-image. MLflow integration tests are intentionally local because their registry
+dependencies, runs Ruff, mypy, the service-independent test suite, and a Docker
+build. MLflow integration tests are intentionally local because their registry
 and artifacts are local-only.
 
 `.github/workflows/deploy.yml` is a separate `workflow_dispatch` workflow for
-`main`. It is implemented and locally validated, but it has not been pushed or
-dispatched. Its WIF pool, provider, deployer account, and two GitHub variables
-also remain pending, so the command below is an operator procedure, not evidence
-of a completed rollout.
+`main`. WIF, the scoped deployer account, and both GitHub variables are live.
+Deployment run `32854613397` completed the first automated rollout from
+`a1615f6` on 2026-08-25; the current audit revision is documented separately
+until its own rollout completes.
 
 For an authorized dispatch, the workflow:
 
@@ -196,19 +199,19 @@ the dedicated runtime identity
 permission is only `roles/storage.objectViewer` on the model bucket. It has no
 project-wide storage role and needs no MLflow or training-data access.
 
-The pending least-privilege deployer design uses no service-account JSON key
-and no GitHub secret. After Task 6, GitHub OIDC trust will be restricted to the
-numeric repository/owner IDs, `main`, and the exact deployment workflow. The
-deployer will receive only:
+The least-privilege deployer uses no service-account JSON key and no GitHub
+secret. GitHub OIDC trust is restricted to numeric repository/owner IDs,
+`main`, and the exact deployment workflow. The deployer has only:
 
 - `roles/iam.workloadIdentityUser` on its service account for that WIF principal;
 - `roles/artifactregistry.writer` on the one image repository;
 - `roles/run.developer` on the one Cloud Run service; and
 - `roles/iam.serviceAccountUser` on the runtime service account.
 
-Those bindings and the WIF resources do not yet exist. No project-level
-deployer role is intended. Generated short-lived `gha-creds-*.json` files are
-ignored by Git and excluded from the Docker build context.
+Those bindings and WIF resources are verified live; there is no project-level
+deployer role. Both deployer and runtime identities have zero user-managed
+keys. Generated short-lived `gha-creds-*.json` files are ignored by Git and
+excluded from the Docker build context.
 
 ## 10. Observability and alert behavior
 
@@ -235,19 +238,20 @@ fixed safe message.
 
 Request payloads, feature names/values, fraud probabilities, tokens,
 credentials, and unknown fields are not serialized. Exception text is also
-excluded because a library message could contain input-derived content. These
-events will reach Cloud Logging only after this source is built and deployed;
-they are not claimed for the unchanged live revision.
+excluded because a library message could contain input-derived content. The
+implementation is deployed, but fresh application-event evidence had aged out
+of the available retention window at the 2026-09-24 audit; live observability
+therefore remains partial until the audit rollout produces new events.
 
 Cloud Run supplies request count, latency, instance count, CPU, and memory
 metrics. The tracked policy defines a `5xx / total requests > 5%` condition for
 five minutes in `europe-west1`, treats missing data as inactive, and closes an
 incident automatically after 30 minutes.
 
-`monitoring/cloud-run-5xx-rate-policy.json` is validated and reproducible, but
-no remote alert policy or notification channel exists. Remote policy creation
-is reserved for Task 8. Without a channel, any later incident is visible in
-Cloud Monitoring but sends no external notification.
+`monitoring/cloud-run-5xx-rate-policy.json` is validated and deployed as policy
+`projects/fraud-risk-engine/alertPolicies/17997922764504296330`. Enabled email
+channel `projects/fraud-risk-engine/notificationChannels/7232674366703482783`
+is attached to the policy.
 
 ## 11. Local setup, tests, Docker, release, deployment, and rollback
 
@@ -270,10 +274,11 @@ python -m mlflow server \
   --port 5000
 ```
 
-Run fast tests/build directly; the integration target needs that restored state:
+Run static checks, fast tests, and the build directly; the integration target
+needs that restored state:
 
 ```bash
-make test
+make check
 make test-integration
 make docker-build-amd64
 ```
@@ -298,8 +303,7 @@ Build and run the same service in Docker with a read-only release mount:
 MODEL_RELEASE_DIR="$PWD/dist/model-release/RELEASE_ID" make docker-run
 ```
 
-After Tasks 6 and 7 establish WIF and publish the workflow on `main`, an
-authorized operator can start the manual deployment:
+An authorized operator can start the manual WIF deployment from `main`:
 
 ```bash
 gh workflow run deploy.yml --ref main \
@@ -339,12 +343,13 @@ creation order and do not delete failed revisions automatically.
 - Private IAM is service-to-service access control, not a public end-user
   authentication layer.
 - There is no real-time drift feedback loop or automated retraining decision.
-- The notification channel is intentionally absent; alert review is manual.
+- Alert delivery depends on the external email system; no deliberate production
+  incident was generated merely to test notification delivery.
 - Release promotion remains manual, including export, approved GCS placement,
   and workflow dispatch.
 - Training data, notebook outputs, MLflow tracking state, and model artifacts
   remain local-only and are intentionally excluded from Git.
-- WIF/IAM setup, GitHub publication, the first automated rollout, and remote
-  alert creation are pending Tasks 6–8.
+- GitHub repository secret scanning is disabled; local tracked-file scanning
+  and zero user-managed service-account keys are the current evidence.
 - Bounded workflow operations reduce ambiguity but cannot guarantee rollback
   after hard runner/job termination; traffic must then be inspected manually.

@@ -1,5 +1,5 @@
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -7,7 +7,6 @@ from fraud_risk.release_export import (
     ResolvedModelVersion,
     build_release_bundle,
 )
-
 from tests.test_release_manifest import FEATURES
 
 

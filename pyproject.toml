@@ -29,6 +29,8 @@ dev = [
     "pytest==9.1.1",
     "httpx2",
     "mlflow==3.15.1",
+    "mypy==2.3.1",
+    "ruff==0.16.8",
 ]
 
 
@@ -44,7 +46,9 @@ where = ["src"]
 testpaths = [
     "tests/test_api.py",
     "tests/test_deploy_workflow.py",
+    "tests/test_load_test.py",
     "tests/test_model_service.py",
+    "tests/test_monitoring_config.py",
     "tests/test_observability.py",
     "tests/test_release_manifest.py",
     "tests/test_model_bundle.py",
@@ -54,3 +58,19 @@ testpaths = [
 markers = [
     "integration: requires a running MLflow server and real model artifacts",
 ]
+
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_unused_ignores = true

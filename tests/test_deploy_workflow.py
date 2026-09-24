@@ -1,16 +1,17 @@
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
-
 
 WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github/workflows/deploy.yml"
 )
+CI_WORKFLOW_PATH = WORKFLOW_PATH.with_name("ci.yml")
+PROJECT_PATH = WORKFLOW_PATH.parents[2] / "pyproject.toml"
 SERVICE_URL = "https://fraud-risk-api.example.run.app"
 
 
@@ -96,6 +97,87 @@ def _promoted_traffic_verifier() -> str:
     )
 
 
+def _candidate_verifier() -> str:
+    return _embedded_step_python(
+        "Verify zero-traffic candidate",
+        "Mint candidate canonical-audience identity token",
+    )
+
+
+def _candidate_state(*, max_scale: str = "3") -> dict:
+    candidate = "fraud-risk-api-candidate"
+    previous = "fraud-risk-api-previous"
+    return {
+        "metadata": {"name": "fraud-risk-api"},
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "autoscaling.knative.dev/maxScale": max_scale,
+                    }
+                },
+                "spec": {
+                    "serviceAccountName": (
+                        "fraud-risk-api-runtime@fraud-risk-engine.iam.gserviceaccount.com"
+                    ),
+                    "containerConcurrency": 4,
+                    "timeoutSeconds": 60,
+                    "containers": [
+                        {
+                            "image": "registry/image@sha256:" + "a" * 64,
+                            "env": [
+                                {
+                                    "name": "MODEL_ARTIFACT_URI",
+                                    "value": "gs://bucket/releases/release/",
+                                }
+                            ],
+                            "resources": {
+                                "limits": {"cpu": "1", "memory": "1Gi"}
+                            },
+                        }
+                    ],
+                },
+            }
+        },
+        "status": {
+            "latestReadyRevisionName": candidate,
+            "traffic": [
+                {
+                    "tag": "candidate-test",
+                    "revisionName": candidate,
+                    "percent": 0,
+                    "url": "https://candidate.example.run.app",
+                },
+                {"revisionName": previous, "percent": 100},
+            ],
+        },
+    }
+
+
+def _run_candidate_verifier(state: dict) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SERVICE_STATE_JSON": json.dumps(state),
+            "CANDIDATE_TAG": "candidate-test",
+            "PREVIOUS_REVISION": "fraud-risk-api-previous",
+            "DIGEST": "sha256:" + "a" * 64,
+            "IMAGE": "registry/image",
+            "MODEL_ARTIFACT_URI": "gs://bucket/releases/release/",
+            "RUNTIME_SERVICE_ACCOUNT": (
+                "fraud-risk-api-runtime@fraud-risk-engine.iam.gserviceaccount.com"
+            ),
+        }
+    )
+    return subprocess.run(
+        [sys.executable, "-c", _candidate_verifier()],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
 def test_cloud_run_identity_tokens_are_minted_by_pinned_wif_action():
     workflow = WORKFLOW_PATH.read_text()
 
@@ -112,6 +194,44 @@ def test_cloud_run_identity_tokens_are_minted_by_pinned_wif_action():
     assert workflow.count("export_environment_variables: false") == 2
     assert "id: candidate_auth" in workflow
     assert "id: canonical_auth" in workflow
+
+
+def test_ci_and_deploy_run_static_quality_gates():
+    ci_workflow = CI_WORKFLOW_PATH.read_text()
+    deploy_workflow = WORKFLOW_PATH.read_text()
+    project = PROJECT_PATH.read_text()
+
+    assert '"ruff==' in project
+    assert '"mypy==' in project
+    assert "python -m ruff check ." in ci_workflow
+    assert "python -m mypy src scripts" in ci_workflow
+    assert "python -m ruff check ." in deploy_workflow
+    assert "python -m mypy src scripts" in deploy_workflow
+
+
+def test_candidate_deploy_uses_unambiguous_scaling_flags():
+    workflow = WORKFLOW_PATH.read_text()
+
+    assert "--min-instances=0" in workflow
+    assert "--max-instances=3" in workflow
+    assert "--min=0" not in workflow
+    assert "--max=3" not in workflow
+
+
+def test_candidate_verifier_rejects_runtime_scaling_drift():
+    result = _run_candidate_verifier(_candidate_state(max_scale="20"))
+
+    assert result.returncode != 0
+    assert "maximum instance count" in result.stderr
+
+
+def test_candidate_verifier_accepts_exact_runtime_contract():
+    result = _run_candidate_verifier(_candidate_state())
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "fraud-risk-api-candidate\thttps://candidate.example.run.app\n"
+    )
 
 
 def test_identity_token_flow_preserves_wif_and_never_logs_credentials():

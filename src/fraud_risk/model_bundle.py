@@ -1,9 +1,10 @@
-from contextlib import contextmanager
-from dataclasses import dataclass
 import hashlib
 import json
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
 import joblib
@@ -52,6 +53,10 @@ class ModelBundleDownloadError(ModelBundleError):
     pass
 
 
+class Preprocessor(Protocol):
+    def transform(self, model_input: pd.DataFrame) -> Any: ...
+
+
 @dataclass(frozen=True)
 class VerifiedModelBundle:
     manifest: ModelReleaseManifest
@@ -62,7 +67,7 @@ class VerifiedModelBundle:
 @dataclass(frozen=True)
 class LoadedModelBundle:
     manifest: ModelReleaseManifest
-    preprocessor: object
+    preprocessor: Preprocessor
     model: XGBClassifier
 
     def predict(self, model_input: pd.DataFrame):
